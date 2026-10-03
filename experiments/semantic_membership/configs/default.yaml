@@ -22,7 +22,11 @@ splits:                          # доли репозиториев public-ко
   public_train: 0.6
   public_calib: 0.2
   public_test: 0.2
+windows:                         # файловые окна protected (сценарий IDE, kind: window)
+  size: 20
+  stride: 10
 transforms:
+  max_per_split: 5000            # функций на набор запросов (стратификация по языку и бину длины)
   programmatic: [identity, reformat, strip_comments, rename_ids, change_literals, insert_deadcode, reorder_stmts, combo]
   partial_lines: [3, 5, 10, 20, 40]
   deadcode_every: 3              # вставка no-op каждые N строк (атака в стиле Mossad)
@@ -35,6 +39,11 @@ fingerprint:
   hmac_key_env: SMCODE_INDEX_KEY  # ключ HMAC для отпечатков (не хранить в репозитории)
   minhash_perm: 128
   minhash_shingle: 5
+  minhash_lsh_threshold: 0.3     # порог LSH для кандидатов M2
+  exact_window: 5                # M0: окна по 5 строк, keyed blake2b-64
+  common_df: 50                  # фильтр общности M1: df по функциям public_train
+  common_file_frac: 0.05         # ... или доля файлов protected
+  common_min_files: 3            # ... и не менее стольких файлов protected
 semantic:
   base_model: microsoft/unixcoder-base
   max_length: 512
@@ -43,8 +52,17 @@ semantic:
   batch_size: 128
   epochs: 2
   lr: 2.0e-5
+  warmup_frac: 0.05
+  weight_decay: 0.01
+  own_lr: 3.0e-4                 # скорость обучения own_small_model
   hard_negatives_per_anchor: 2
   ann_top_k: 20
+  hybrid_rule: logistic          # logistic | two_threshold (абляция)
+  hybrid_thresholds: {cos: 0.8, overlap: 0.2}   # правило двух порогов, формула (9) статьи
+  combiner_C: 1.0
+  combiner_n_index: 20000        # обучение комбинатора на public_train (половина репозиториев)
+  combiner_n_anchors: 2000
+  combiner_n_neg: 2000           # функции второй половины репозиториев (вне индекса)
   own_small_model:               # вариант "своя модель с нуля" (лицензионно чистый)
     enabled: false
     layers: 6
@@ -53,7 +71,8 @@ semantic:
     vocab: 32000
 calibration:
   alphas: [0.01, 0.001]
-  method: split_conformal        # порог = квантиль (1-alpha)(1+1/n) по негативам калибровки
+  method: split_conformal        # порог = ⌈(n+1)(1-alpha)⌉-я порядковая статистика скоров негативов; решение score > τ
+  domain_calib_fraction: 0.5     # доля репозиториев hard_neg в доменной калибровке (остальные — тест)
 privacy:
   projection: keyed_orthogonal
   quant_bits: [8, 4, 1]

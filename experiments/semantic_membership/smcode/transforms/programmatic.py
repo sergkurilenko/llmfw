@@ -562,7 +562,12 @@ def _collect_declared(p: Parsed) -> tuple[list[str], list[Any]]:
                 seen.add(t)
                 names.append(t)
         elif node.type in ("pattern_list", "tuple_pattern", "list_pattern", "expression_list", "array_pattern",
-                           "parenthesized_declarator", "pointer_declarator", "reference_declarator",
+                           "parenthesized_expression"):
+            # контейнеры паттернов: все идентификаторы внутри (рекурсивно)
+            for c in node.children:
+                if c.is_named:
+                    add(c)
+        elif node.type in ("parenthesized_declarator", "pointer_declarator", "reference_declarator",
                            "array_declarator", "init_declarator", "variable_declarator", "inferred_parameters",
                            "lambda_parameters", "default_parameter", "typed_parameter", "typed_default_parameter",
                            "list_splat_pattern", "dictionary_splat_pattern", "rest_pattern", "assignment_pattern",
@@ -706,7 +711,11 @@ def _excluded_use(p: Parsed, node) -> bool:
         if pt in ("import_statement", "import_from_statement", "dotted_name", "aliased_import", "decorator"):
             return True
     elif lang in ("c", "cpp"):
-        if pt in ("qualified_identifier", "preproc_def", "preproc_function_def", "preproc_ifdef"):
+        if pt == "qualified_identifier":
+            gp = par.parent
+            # Foo::bar в объявлении функции — переименовываем; остальные квалифицированные имена — нет
+            return not (field == "name" and gp is not None and gp.type == "function_declarator")
+        if pt in ("preproc_def", "preproc_function_def", "preproc_ifdef"):
             return True
         if pt == "field_designator" or pt == "designated_initializer":
             return True
@@ -792,6 +801,10 @@ def rename_ids(code: str, lang: str, rng: random.Random, **params: Any) -> Trans
             t = p.text(n)
             if t in mapping and not _excluded_use(p, n):
                 edits.append((n.start_byte, n.end_byte, mapping[t].encode("utf-8")))
+        elif lang == "javascript" and n.type == "shorthand_property_identifier":
+            t = p.text(n)  # {a} → {a: v1}: сохраняем имя свойства, подставляем новое имя переменной
+            if t in mapping:
+                edits.append((n.start_byte, n.end_byte, f"{t}: {mapping[t]}".encode("utf-8")))
     for n in fn_name_nodes:
         t = p.text(n)
         if t in mapping:
@@ -864,8 +877,6 @@ def _new_string(text: str, rng: random.Random) -> str | None:
         n = max(1, min(len(content) // 4 + 1, 6))
         words = [rng.choice(_WORDS) for _ in range(n)]
     new_content = " ".join(words)
-    if len(q) == 1 and "\n" in content and pre.lower() not in ("r", "b", "f", "br", "rb", "fr", "rf", "u"):
-        pass
     out = pre + q + new_content + q
     return None if out == text else out
 

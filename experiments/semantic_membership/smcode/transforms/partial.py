@@ -81,7 +81,6 @@ def partial(code: str, lang: str, rng: random.Random, L: int = 5, **params: Any)
         rows = [r for r in range(pre_rows, pre_rows + n_orig) if orig_lines[r - pre_rows].strip()]
         if len(rows) < L or len(rows) == L and L >= n_orig:
             return TransformResult.failed("partial", {"L": L})
-    pos_of = {r: i for i, r in enumerate(rows)}
     n_windows = len(rows) - L + 1
     both = [i for i in range(n_windows) if rows[i] in starts and rows[i + L - 1] in ends]
     start_only = [i for i in range(n_windows) if rows[i] in starts and i not in both]
@@ -109,7 +108,6 @@ def partial(code: str, lang: str, rng: random.Random, L: int = 5, **params: Any)
     if out.strip() == code.strip():
         return TransformResult.failed("partial", {"L": L})
     aligned = "both" if chosen in both else ("start" if chosen in start_only else "none")
-    _ = pos_of
     return TransformResult(code=out, name="partial",
                            params={"L": L, "start_line": int(rows[chosen] - pre_rows), "aligned": aligned,
                                    "parses": chosen_parses}, ok=True)

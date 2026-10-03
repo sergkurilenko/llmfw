@@ -2,14 +2,20 @@
 # Шаг 00: клонирование репозиториев (DESIGN.md §2.2).
 #
 # Список "<split> <owner>/<name>" печатает python -m smcode.data.list_repos (он же сохраняет
-# распределение в data/functions/repo_splits.json). Клоны: data/raw/<split>/<owner>__<name>,
-# shallow (--depth 1, без сабмодулей), 3 попытки, параллельно (xargs -P), идемпотентно
-# (готовый клон с маркером .cloned пропускается), пропуск репозиториев > MAX_MB после клона
-# (список пропущенных — data/raw/skipped.txt).
+# распределение в data/functions/repo_splits.json; если seed/доли/repos.yaml изменились с момента
+# сохранения, он завершается ошибкой — нужен --force, который пересчитывает распределение и
+# переклонирует всё). Клоны: data/raw/<split>/<owner>__<name>, shallow (--depth 1, без
+# сабмодулей), 3 попытки, параллельно (xargs -P), идемпотентно (клон с маркером .cloned
+# пропускается). После клона .git удаляется.
+# Лимит размера: «полезный» размер репозитория — файлы вне extract.skip_dirs и <= 1 МБ, т.е. то,
+# что читает извлечение (python -m smcode.data.extract --measure); если он > MAX_MB или сырой
+# размер дерева > MAX_RAW_MB, клон удаляется и попадает в data/raw/skipped.txt. Ошибки клонирования
+# — data/raw/failed.txt.
 #
 # Использование:
-#   scripts/00_clone.sh --config configs/default.yaml [--jobs 4] [--max-mb 300] [--force] [--dry-run]
-# Переменные окружения: PYTHON (интерпретатор), GIT_CLONE_TIMEOUT (сек, по умолчанию 1800).
+#   scripts/00_clone.sh --config configs/default.yaml [--jobs 4] [--max-mb 300] [--max-raw-mb 2000] [--force] [--dry-run]
+# Переменные окружения: PYTHON (интерпретатор venv), GIT_CLONE_TIMEOUT (сек, по умолчанию 1800),
+# SMCODE_MAX_REPO_MB, SMCODE_MAX_RAW_MB.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -17,6 +23,7 @@ cd "$(dirname "$0")/.."
 CONFIG="configs/default.yaml"
 JOBS=4
 MAX_MB=${SMCODE_MAX_REPO_MB:-300}
+MAX_RAW_MB=${SMCODE_MAX_RAW_MB:-2000}
 FORCE=0
 DRY_RUN=0
 while [[ $# -gt 0 ]]; do
@@ -24,9 +31,10 @@ while [[ $# -gt 0 ]]; do
     --config) CONFIG="$2"; shift 2 ;;
     --jobs) JOBS="$2"; shift 2 ;;
     --max-mb) MAX_MB="$2"; shift 2 ;;
+    --max-raw-mb) MAX_RAW_MB="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -35,15 +43,18 @@ PYTHON=${PYTHON:-python}
 RAW_DIR=$("$PYTHON" -c "import sys; from smcode.config import load_config, resolve_path; print(resolve_path(load_config(sys.argv[1]), 'raw_repos'))" "$CONFIG")
 mkdir -p "$RAW_DIR"
 LIST_FILE="$RAW_DIR/repo_list.txt"
-"$PYTHON" -m smcode.data.list_repos --config "$CONFIG" --print-splits > "$LIST_FILE"
-echo "repos: $(wc -l < "$LIST_FILE"), dest: $RAW_DIR, jobs: $JOBS, max_mb: $MAX_MB"
+LIST_ARGS="--print-splits"
+if [[ "$FORCE" == "1" ]]; then LIST_ARGS="$LIST_ARGS --force"; fi
+# shellcheck disable=SC2086
+"$PYTHON" -m smcode.data.list_repos --config "$CONFIG" $LIST_ARGS > "$LIST_FILE"
+echo "repos: $(wc -l < "$LIST_FILE"), dest: $RAW_DIR, jobs: $JOBS, max_mb: $MAX_MB (effective), max_raw_mb: $MAX_RAW_MB"
 
 if [[ "$DRY_RUN" == "1" ]]; then
   cat "$LIST_FILE"
   exit 0
 fi
 
-export RAW_DIR MAX_MB FORCE
+export RAW_DIR MAX_MB MAX_RAW_MB FORCE CONFIG PYTHON
 export GIT_TERMINAL_PROMPT=0
 export GIT_CLONE_TIMEOUT=${GIT_CLONE_TIMEOUT:-1800}
 
@@ -79,16 +90,23 @@ clone_one() {
     sleep $((attempt * 10))
   done
   rm -rf "$dest/.git"   # история не нужна; экономим место и ускоряем обход
-  local size_mb
-  size_mb=$(du -sm "$dest" | cut -f1)
-  if [[ "$size_mb" -gt "$MAX_MB" ]]; then
-    echo "[skip-size] $split $repo (${size_mb} MB > ${MAX_MB} MB)"
+  # размер: raw — всё дерево; eff — файлы вне skip_dirs и <= 1 МБ (то, что читает извлечение)
+  local sizes raw_mb eff_mb
+  if sizes=$("$PYTHON" -m smcode.data.extract --config "$CONFIG" --measure "$dest" 2>/dev/null); then
+    raw_mb=${sizes%% *}
+    eff_mb=${sizes##* }
+  else
+    raw_mb=$(du -sm "$dest" | cut -f1)
+    eff_mb=$raw_mb
+  fi
+  if [[ "$eff_mb" -gt "$MAX_MB" || "$raw_mb" -gt "$MAX_RAW_MB" ]]; then
+    echo "[skip-size] $split $repo (effective ${eff_mb} MB > ${MAX_MB} MB or raw ${raw_mb} MB > ${MAX_RAW_MB} MB)"
     rm -rf "$dest"
     echo "$split $repo" >> "$RAW_DIR/skipped.txt"
     return 0
   fi
   touch "$dest/.cloned"
-  echo "[ok] $split $repo (${size_mb} MB)"
+  echo "[ok] $split $repo (raw ${raw_mb} MB, effective ${eff_mb} MB)"
 }
 export -f clone_one
 

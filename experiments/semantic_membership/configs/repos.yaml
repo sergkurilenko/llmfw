@@ -1,8 +1,12 @@
 # Списки репозиториев для стенда «семантическое членство кода» (DESIGN.md §2.1).
 #
 # protected_pool — кандидаты домена security/network/crypto. Из них детерминированно
-#   (seed из default.yaml, smcode.data.list_repos.split_repos) выбираются ~n_protected
-#   репозиториев в роль `protected`, остальные становятся `hard_neg`.
+#   (seed из default.yaml, smcode.data.list_repos.split_repos) выбираются n_protected
+#   репозиториев в роль `protected`, остальные становятся `hard_neg`; выбор стратифицирован по
+#   языку (квоты пропорциональны пулу, каждый язык присутствует в обеих ролях), поэтому в пуле
+#   должно быть >= 2 репозитория на каждый язык из default.yaml: languages.
+#   Распределение сохраняется в data/functions/repo_splits.json вместе с sha1 этого файла;
+#   после правки списков его нужно пересчитать (`--force`) и повторить клонирование.
 # public — репозитории других предметных областей; делятся по репозиториям на
 #   public_train / public_calib / public_test (доли из default.yaml: splits), со
 #   стратификацией по языку.
@@ -42,6 +46,18 @@ protected_pool:
   - {repo: bcgit/bc-java, lang: java}
   - {repo: netty/netty, lang: java}
   - {repo: nodejs/undici, lang: javascript}
+  - {repo: apache/mina-sshd, lang: java}
+  - {repo: hierynomus/sshj, lang: java}
+  - {repo: jwtk/jjwt, lang: java}
+  - {repo: apache/shiro, lang: java}
+  - {repo: tink-crypto/tink-java, lang: java}
+  - {repo: mscdex/ssh2, lang: javascript}
+  - {repo: digitalbazaar/forge, lang: javascript}
+  - {repo: brix/crypto-js, lang: javascript}
+  - {repo: paulmillr/noble-ciphers, lang: javascript}
+  - {repo: panva/jose, lang: javascript}
+  - {repo: websockets/ws, lang: javascript}
+  - {repo: http-party/node-http-proxy, lang: javascript}
 
 public:
   # ---------------------------------------------------------------- python
@@ -295,7 +311,6 @@ public:
   - {repo: alibaba/fastjson2, lang: java}
   - {repo: alibaba/arthas, lang: java}
   - {repo: iluwatar/java-design-patterns, lang: java}
-  - {repo: TheAlgorithms/Java, lang: java}
   - {repo: bumptech/glide, lang: java}
   - {repo: square/picasso, lang: java}
   - {repo: square/javapoet, lang: java}
@@ -425,7 +440,10 @@ public:
   - {repo: Dogfalo/materialize, lang: javascript}
 
 # Ключевые слова домена protected/hard_neg (сравнение по словам, регистр не важен; слова длиной
-# >= 4 символов ищутся и как подстроки, напр. "crypto" -> "cryptography", "cryptopp").
+# >= 4 символов ищутся и как подстроки, напр. "crypto" -> "cryptography", "cryptopp"; короткие
+# ключи (ssl, ssh, vpn, ids) — только как отдельные слова, поэтому составные формы перечислены
+# явно: openvpn, libssh, sshd, ssh2, ...). Фильтр по пути файла внутри public-репозиториев —
+# smcode.data.extract.domain_path_match.
 domain_keywords:
   - security
   - secure
@@ -479,3 +497,24 @@ domain_keywords:
   - snort
   - suricata
   - zeek
+  - openvpn
+  - strongswan
+  - libssh
+  - sshd
+  - ssh2
+  - sshj
+  - jwt
+  - jose
+  - sodium
+  - impacket
+  - paramiko
+  - scapy
+  - osquery
+  - ndpi
+  - cfssl
+  - coredns
+  - cert
+  - keystore
+  - oauth
+  - kerberos
+  - honeypot

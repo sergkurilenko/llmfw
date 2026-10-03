@@ -154,11 +154,28 @@ def reorder_stmts(code: str, lang: str, rng: random.Random, **params: Any) -> Tr
     нет вызовов, между ними нет комментариев)."""
     lang = canon_lang(lang)
     p = parse_code(code, lang)
+    first_offset = rng.randint(0, 1)
+    edits: list[tuple[int, int, bytes]] = []
+    n_swaps = 0
+    for offset in (first_offset, 1 - first_offset):
+        edits, n_swaps = _collect_swaps(p, offset)
+        if edits:
+            break
+    if not edits:
+        return TransformResult.failed("reorder_stmts", {})
+    out = p.unwrap(apply_edits(p.src, edits))
+    if out == code:
+        return TransformResult.failed("reorder_stmts", {})
+    return TransformResult(code=out, name="reorder_stmts", params={"n_swaps": n_swaps}, ok=True)
+
+
+def _collect_swaps(p: Parsed, offset: int) -> tuple[list[tuple[int, int, bytes]], int]:
+    """Жадный подбор непересекающихся пар соседних независимых операторов, начиная с позиции offset."""
     edits: list[tuple[int, int, bytes]] = []
     n_swaps = 0
     for block in _iter_blocks(p):
         stmts = block_children(p, block)
-        i = rng.randint(0, 1) if len(stmts) > 2 else 0
+        i = offset if len(stmts) > 2 else 0
         while i + 1 < len(stmts):
             a, b = stmts[i], stmts[i + 1]
             if _is_simple_safe(p, a) and _is_simple_safe(p, b) and _first_on_line(p, a) is not None \
@@ -171,9 +188,4 @@ def reorder_stmts(code: str, lang: str, rng: random.Random, **params: Any) -> Tr
                     i += 2
                     continue
             i += 1
-    if not edits:
-        return TransformResult.failed("reorder_stmts", {})
-    out = p.unwrap(apply_edits(p.src, edits))
-    if out == code:
-        return TransformResult.failed("reorder_stmts", {})
-    return TransformResult(code=out, name="reorder_stmts", params={"n_swaps": n_swaps}, ok=True)
+    return edits, n_swaps

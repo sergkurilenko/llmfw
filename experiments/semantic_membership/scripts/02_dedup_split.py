@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""Шаг 02: дедупликация корпуса функций (DESIGN.md §2.3): точные дубликаты внутри сплитов,
+"""Шаг 02: дедупликация корпуса функций (DESIGN.md §2.3): дубликаты по sha внутри сплитов,
 near-dup фильтр hard_neg/public_* против protected по winnowing-отпечаткам, stats.json.
 
     python scripts/02_dedup_split.py --config configs/default.yaml [--workers 4] [--force]
-Идемпотентно: при наличии data/functions/stats.json шаг пропускается без --force.
+Идемпотентно: шаг пропускается, если data/functions/stats.json существует и новее всех входных
+<split>.jsonl / protected_windows.jsonl (иначе — пересчёт; --force — всегда пересчёт).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Дедупликация data/functions/*.jsonl")
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--force", action="store_true", help="выполнить заново даже при наличии stats.json")
+    ap.add_argument("--force", action="store_true", help="выполнить заново даже при актуальном stats.json")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
