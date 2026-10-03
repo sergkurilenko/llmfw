@@ -1,0 +1,66 @@
+# Единая конфигурация стенда "семантическое членство кода".
+# Пути относительно experiments/semantic_membership/.
+seed: 20261003
+paths:
+  raw_repos: data/raw            # клоны репозиториев
+  functions: data/functions      # {split}.jsonl
+  queries: data/queries          # {set}.jsonl
+  indexes: data/indexes
+  results: results
+  figures: ../../paper/figures
+languages: [python, c, cpp, go, java, javascript]
+extract:
+  min_lines: 3
+  max_lines: 300
+  max_tokens: 2048
+  skip_dirs: [vendor, third_party, thirdparty, external, deps, node_modules, test, tests, testdata, examples, benchmarks, build, dist, contrib, submodules]
+dedup:
+  k: 25                          # k-грамма для near-dup фильтра между сплитами
+  w: 25
+  overlap_threshold: 0.3         # доля общих отпечатков, выше которой функция считается дубликатом
+splits:                          # доли репозиториев public-корпуса
+  public_train: 0.6
+  public_calib: 0.2
+  public_test: 0.2
+transforms:
+  programmatic: [identity, reformat, strip_comments, rename_ids, change_literals, insert_deadcode, reorder_stmts, combo]
+  partial_lines: [3, 5, 10, 20, 40]
+  deadcode_every: 3              # вставка no-op каждые N строк (атака в стиле Mossad)
+  llm: [paraphrase, translate]   # только на GPU-машине, см. transforms/llm_paraphrase.py
+  llm_model: Qwen/Qwen2.5-Coder-7B-Instruct
+  llm_sample_per_split: 5000
+fingerprint:
+  k: 25
+  w: 25
+  hmac_key_env: SMCODE_INDEX_KEY  # ключ HMAC для отпечатков (не хранить в репозитории)
+  minhash_perm: 128
+  minhash_shingle: 5
+semantic:
+  base_model: microsoft/unixcoder-base
+  max_length: 512
+  pooling: mean
+  temperature: 0.05
+  batch_size: 128
+  epochs: 2
+  lr: 2.0e-5
+  hard_negatives_per_anchor: 2
+  ann_top_k: 20
+  own_small_model:               # вариант "своя модель с нуля" (лицензионно чистый)
+    enabled: false
+    layers: 6
+    hidden: 384
+    heads: 6
+    vocab: 32000
+calibration:
+  alphas: [0.01, 0.001]
+  method: split_conformal        # порог = квантиль (1-alpha)(1+1/n) по негативам калибровки
+privacy:
+  projection: keyed_orthogonal
+  quant_bits: [8, 4, 1]
+  noise_sigma: [0.0, 0.05, 0.1, 0.2]
+  attack_leaked_pairs: [0, 100, 1000, 10000]
+  bow_vocab: 20000
+eval:
+  bootstrap: 1000
+  latency_repeats: 200
+  length_bins_tokens: [[0, 32], [32, 64], [64, 128], [128, 256], [256, 100000]]

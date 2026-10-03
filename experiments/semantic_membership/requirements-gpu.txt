@@ -1,0 +1,7 @@
+-r requirements.txt
+torch>=2.3
+transformers>=4.44
+sentence-transformers>=3.0
+faiss-cpu>=1.8          # или faiss-gpu
+accelerate>=0.33
+vllm>=0.6               # для LLM-преобразований (paraphrase/translate); опционально
