@@ -1,0 +1,481 @@
+# Списки репозиториев для стенда «семантическое членство кода» (DESIGN.md §2.1).
+#
+# protected_pool — кандидаты домена security/network/crypto. Из них детерминированно
+#   (seed из default.yaml, smcode.data.list_repos.split_repos) выбираются ~n_protected
+#   репозиториев в роль `protected`, остальные становятся `hard_neg`.
+# public — репозитории других предметных областей; делятся по репозиториям на
+#   public_train / public_calib / public_test (доли из default.yaml: splits), со
+#   стратификацией по языку.
+# domain_keywords — ключевые слова домена protected/hard_neg; репозитории, у которых
+#   имя/описание/темы содержат такое слово, исключаются из public (используется при
+#   расширении списка через api.github.com и как проверка ручного списка).
+#
+# Формат записи: {repo: owner/name, lang: <python|c|cpp|go|java|javascript>}.
+# Переименованные на GitHub репозитории клонируются через редирект.
+# Лицензии и доступность проверяются при клонировании (scripts/00_clone.sh); репозитории
+# размером > 300 МБ пропускаются.
+
+n_protected: 12
+
+protected_pool:
+  - {repo: OpenVPN/openvpn, lang: c}
+  - {repo: strongswan/strongswan, lang: c}
+  - {repo: libssh2/libssh2, lang: c}
+  - {repo: wolfSSL/wolfssl, lang: c}
+  - {repo: jedisct1/libsodium, lang: c}
+  - {repo: the-tcpdump-group/libpcap, lang: c}
+  - {repo: ntop/nDPI, lang: c}
+  - {repo: snort3/snort3, lang: cpp}
+  - {repo: OISF/suricata, lang: c}
+  - {repo: osquery/osquery, lang: cpp}
+  - {repo: zeek/zeek, lang: cpp}
+  - {repo: slackhq/nebula, lang: go}
+  - {repo: cloudflare/cfssl, lang: go}
+  - {repo: smallstep/certificates, lang: go}
+  - {repo: coredns/coredns, lang: go}
+  - {repo: secdev/scapy, lang: python}
+  - {repo: pyca/cryptography, lang: python}
+  - {repo: paramiko/paramiko, lang: python}
+  - {repo: fortra/impacket, lang: python}
+  - {repo: mitmproxy/mitmproxy, lang: python}
+  - {repo: weidai11/cryptopp, lang: cpp}
+  - {repo: bcgit/bc-java, lang: java}
+  - {repo: netty/netty, lang: java}
+  - {repo: nodejs/undici, lang: javascript}
+
+public:
+  # ---------------------------------------------------------------- python
+  - {repo: pallets/flask, lang: python}
+  - {repo: psf/requests, lang: python}
+  - {repo: fastapi/fastapi, lang: python}
+  - {repo: django/django, lang: python}
+  - {repo: pallets/click, lang: python}
+  - {repo: pallets/jinja, lang: python}
+  - {repo: pallets/werkzeug, lang: python}
+  - {repo: pydantic/pydantic, lang: python}
+  - {repo: numpy/numpy, lang: python}
+  - {repo: pandas-dev/pandas, lang: python}
+  - {repo: scikit-learn/scikit-learn, lang: python}
+  - {repo: matplotlib/matplotlib, lang: python}
+  - {repo: sympy/sympy, lang: python}
+  - {repo: pytest-dev/pytest, lang: python}
+  - {repo: psf/black, lang: python}
+  - {repo: python-pillow/Pillow, lang: python}
+  - {repo: celery/celery, lang: python}
+  - {repo: sqlalchemy/sqlalchemy, lang: python}
+  - {repo: fastapi/typer, lang: python}
+  - {repo: tqdm/tqdm, lang: python}
+  - {repo: encode/starlette, lang: python}
+  - {repo: Textualize/rich, lang: python}
+  - {repo: Textualize/textual, lang: python}
+  - {repo: python-poetry/poetry, lang: python}
+  - {repo: pypa/pip, lang: python}
+  - {repo: ipython/ipython, lang: python}
+  - {repo: bottlepy/bottle, lang: python}
+  - {repo: falconry/falcon, lang: python}
+  - {repo: marshmallow-code/marshmallow, lang: python}
+  - {repo: pydata/xarray, lang: python}
+  - {repo: dask/dask, lang: python}
+  - {repo: statsmodels/statsmodels, lang: python}
+  - {repo: mwaskom/seaborn, lang: python}
+  - {repo: plotly/plotly.py, lang: python}
+  - {repo: bokeh/bokeh, lang: python}
+  - {repo: streamlit/streamlit, lang: python}
+  - {repo: gradio-app/gradio, lang: python}
+  - {repo: keras-team/keras, lang: python}
+  - {repo: sphinx-doc/sphinx, lang: python}
+  - {repo: mkdocs/mkdocs, lang: python}
+  - {repo: pygments/pygments, lang: python}
+  - {repo: python/mypy, lang: python}
+  - {repo: pylint-dev/pylint, lang: python}
+  - {repo: PyCQA/flake8, lang: python}
+  - {repo: nedbat/coveragepy, lang: python}
+  - {repo: HypothesisWorks/hypothesis, lang: python}
+  - {repo: explosion/spaCy, lang: python}
+  - {repo: nltk/nltk, lang: python}
+  - {repo: scikit-image/scikit-image, lang: python}
+  - {repo: joblib/joblib, lang: python}
+  - {repo: python-attrs/attrs, lang: python}
+  - {repo: dateutil/dateutil, lang: python}
+  - {repo: pyparsing/pyparsing, lang: python}
+  - {repo: spotify/luigi, lang: python}
+  - {repo: Pylons/pyramid, lang: python}
+  - {repo: benoitc/gunicorn, lang: python}
+  - {repo: pytransitions/transitions, lang: python}
+  - {repo: agronholm/apscheduler, lang: python}
+  # ---------------------------------------------------------------- c
+  - {repo: redis/redis, lang: c}
+  - {repo: antirez/sds, lang: c}
+  - {repo: git/git, lang: c}
+  - {repo: jqlang/jq, lang: c}
+  - {repo: vim/vim, lang: c}
+  - {repo: neovim/neovim, lang: c}
+  - {repo: tmux/tmux, lang: c}
+  - {repo: lua/lua, lang: c}
+  - {repo: micropython/micropython, lang: c}
+  - {repo: FFmpeg/FFmpeg, lang: c}
+  - {repo: libgit2/libgit2, lang: c}
+  - {repo: madler/zlib, lang: c}
+  - {repo: lz4/lz4, lang: c}
+  - {repo: facebook/zstd, lang: c}
+  - {repo: pnggroup/libpng, lang: c}
+  - {repo: libjpeg-turbo/libjpeg-turbo, lang: c}
+  - {repo: nothings/stb, lang: c}
+  - {repo: DaveGamble/cJSON, lang: c}
+  - {repo: json-c/json-c, lang: c}
+  - {repo: libexpat/libexpat, lang: c}
+  - {repo: tree-sitter/tree-sitter, lang: c}
+  - {repo: raysan5/raylib, lang: c}
+  - {repo: libsdl-org/SDL, lang: c}
+  - {repo: mpv-player/mpv, lang: c}
+  - {repo: ImageMagick/ImageMagick, lang: c}
+  - {repo: postgres/postgres, lang: c}
+  - {repo: php/php-src, lang: c}
+  - {repo: ruby/ruby, lang: c}
+  - {repo: util-linux/util-linux, lang: c}
+  - {repo: jemalloc/jemalloc, lang: c}
+  - {repo: rui314/chibicc, lang: c}
+  - {repo: mruby/mruby, lang: c}
+  - {repo: janet-lang/janet, lang: c}
+  - {repo: wren-lang/wren, lang: c}
+  - {repo: libffi/libffi, lang: c}
+  - {repo: PCRE2Project/pcre2, lang: c}
+  - {repo: kkos/oniguruma, lang: c}
+  - {repo: bellard/quickjs, lang: c}
+  - {repo: Genymobile/scrcpy, lang: c}
+  - {repo: ggreer/the_silver_searcher, lang: c}
+  - {repo: uncrustify/uncrustify, lang: c}
+  - {repo: swaywm/sway, lang: c}
+  - {repo: i3/i3, lang: c}
+  - {repo: darktable-org/darktable, lang: c}
+  # ---------------------------------------------------------------- cpp
+  - {repo: nlohmann/json, lang: cpp}
+  - {repo: fmtlib/fmt, lang: cpp}
+  - {repo: ggml-org/llama.cpp, lang: cpp}
+  - {repo: google/googletest, lang: cpp}
+  - {repo: gabime/spdlog, lang: cpp}
+  - {repo: catchorg/Catch2, lang: cpp}
+  - {repo: abseil/abseil-cpp, lang: cpp}
+  - {repo: protocolbuffers/protobuf, lang: cpp}
+  - {repo: google/leveldb, lang: cpp}
+  - {repo: facebook/rocksdb, lang: cpp}
+  - {repo: tesseract-ocr/tesseract, lang: cpp}
+  - {repo: ocornut/imgui, lang: cpp}
+  - {repo: taskflow/taskflow, lang: cpp}
+  - {repo: duckdb/duckdb, lang: cpp}
+  - {repo: google/flatbuffers, lang: cpp}
+  - {repo: simdjson/simdjson, lang: cpp}
+  - {repo: Tencent/rapidjson, lang: cpp}
+  - {repo: SFML/SFML, lang: cpp}
+  - {repo: bulletphysics/bullet3, lang: cpp}
+  - {repo: assimp/assimp, lang: cpp}
+  - {repo: pybind/pybind11, lang: cpp}
+  - {repo: uxlfoundation/oneTBB, lang: cpp}
+  - {repo: doctest/doctest, lang: cpp}
+  - {repo: microsoft/terminal, lang: cpp}
+  - {repo: cameron314/concurrentqueue, lang: cpp}
+  - {repo: skypjack/entt, lang: cpp}
+  - {repo: g-truc/glm, lang: cpp}
+  - {repo: bblanchon/ArduinoJson, lang: cpp}
+  - {repo: aseprite/aseprite, lang: cpp}
+  - {repo: rui314/mold, lang: cpp}
+  - {repo: ArthurSonzogni/FTXUI, lang: cpp}
+  - {repo: p-ranav/argparse, lang: cpp}
+  - {repo: jarro2783/cxxopts, lang: cpp}
+  - {repo: CLIUtils/CLI11, lang: cpp}
+  - {repo: gflags/gflags, lang: cpp}
+  - {repo: google/glog, lang: cpp}
+  - {repo: google/benchmark, lang: cpp}
+  - {repo: google/re2, lang: cpp}
+  - {repo: microsoft/STL, lang: cpp}
+  - {repo: facebook/folly, lang: cpp}
+  - {repo: dmlc/xgboost, lang: cpp}
+  - {repo: microsoft/LightGBM, lang: cpp}
+  - {repo: KhronosGroup/glslang, lang: cpp}
+  - {repo: Kitware/CMake, lang: cpp}
+  - {repo: opencv/opencv, lang: cpp}
+  - {repo: apache/arrow, lang: cpp}
+  - {repo: xtensor-stack/xtensor, lang: cpp}
+  - {repo: Dobiasd/FunctionalPlus, lang: cpp}
+  - {repo: mlpack/mlpack, lang: cpp}
+  - {repo: carbon-language/carbon-lang, lang: cpp}
+  # ---------------------------------------------------------------- go
+  - {repo: gin-gonic/gin, lang: go}
+  - {repo: gohugoio/hugo, lang: go}
+  - {repo: spf13/cobra, lang: go}
+  - {repo: spf13/viper, lang: go}
+  - {repo: junegunn/fzf, lang: go}
+  - {repo: go-gitea/gitea, lang: go}
+  - {repo: hashicorp/terraform, lang: go}
+  - {repo: prometheus/prometheus, lang: go}
+  - {repo: gorilla/mux, lang: go}
+  - {repo: labstack/echo, lang: go}
+  - {repo: gofiber/fiber, lang: go}
+  - {repo: beego/beego, lang: go}
+  - {repo: go-chi/chi, lang: go}
+  - {repo: sirupsen/logrus, lang: go}
+  - {repo: uber-go/zap, lang: go}
+  - {repo: rs/zerolog, lang: go}
+  - {repo: stretchr/testify, lang: go}
+  - {repo: spf13/afero, lang: go}
+  - {repo: spf13/pflag, lang: go}
+  - {repo: urfave/cli, lang: go}
+  - {repo: charmbracelet/bubbletea, lang: go}
+  - {repo: charmbracelet/lipgloss, lang: go}
+  - {repo: charmbracelet/glow, lang: go}
+  - {repo: jesseduffield/lazygit, lang: go}
+  - {repo: jesseduffield/lazydocker, lang: go}
+  - {repo: wagoodman/dive, lang: go}
+  - {repo: go-kit/kit, lang: go}
+  - {repo: go-sql-driver/mysql, lang: go}
+  - {repo: lib/pq, lang: go}
+  - {repo: jackc/pgx, lang: go}
+  - {repo: jmoiron/sqlx, lang: go}
+  - {repo: go-gorm/gorm, lang: go}
+  - {repo: ent/ent, lang: go}
+  - {repo: goccy/go-json, lang: go}
+  - {repo: json-iterator/go, lang: go}
+  - {repo: tidwall/gjson, lang: go}
+  - {repo: dgraph-io/badger, lang: go}
+  - {repo: syndtr/goleveldb, lang: go}
+  - {repo: hashicorp/raft, lang: go}
+  - {repo: etcd-io/bbolt, lang: go}
+  - {repo: etcd-io/etcd, lang: go}
+  - {repo: golang-migrate/migrate, lang: go}
+  - {repo: pressly/goose, lang: go}
+  - {repo: air-verse/air, lang: go}
+  - {repo: goreleaser/goreleaser, lang: go}
+  - {repo: golangci/golangci-lint, lang: go}
+  - {repo: mvdan/sh, lang: go}
+  - {repo: go-task/task, lang: go}
+  - {repo: magefile/mage, lang: go}
+  - {repo: gofrs/uuid, lang: go}
+  - {repo: google/uuid, lang: go}
+  - {repo: google/go-cmp, lang: go}
+  - {repo: google/wire, lang: go}
+  - {repo: go-playground/validator, lang: go}
+  - {repo: go-viper/mapstructure, lang: go}
+  - {repo: BurntSushi/toml, lang: go}
+  - {repo: pelletier/go-toml, lang: go}
+  - {repo: go-yaml/yaml, lang: go}
+  - {repo: olekukonko/tablewriter, lang: go}
+  - {repo: fatih/color, lang: go}
+  - {repo: mattn/go-sqlite3, lang: go}
+  - {repo: docker/cli, lang: go}
+  - {repo: helm/helm, lang: go}
+  - {repo: 99designs/gqlgen, lang: go}
+  - {repo: graphql-go/graphql, lang: go}
+  - {repo: gobuffalo/buffalo, lang: go}
+  - {repo: golang/groupcache, lang: go}
+  - {repo: patrickmn/go-cache, lang: go}
+  - {repo: allegro/bigcache, lang: go}
+  - {repo: hajimehoshi/ebiten, lang: go}
+  - {repo: fogleman/gg, lang: go}
+  - {repo: fogleman/primitive, lang: go}
+  - {repo: disintegration/imaging, lang: go}
+  - {repo: influxdata/influxdb, lang: go}
+  - {repo: robfig/cron, lang: go}
+  - {repo: hashicorp/hcl, lang: go}
+  # ---------------------------------------------------------------- java
+  - {repo: apache/commons-lang, lang: java}
+  - {repo: google/gson, lang: java}
+  - {repo: google/guava, lang: java}
+  - {repo: spring-projects/spring-boot, lang: java}
+  - {repo: spring-projects/spring-framework, lang: java}
+  - {repo: ReactiveX/RxJava, lang: java}
+  - {repo: junit-team/junit5, lang: java}
+  - {repo: mockito/mockito, lang: java}
+  - {repo: FasterXML/jackson-databind, lang: java}
+  - {repo: FasterXML/jackson-core, lang: java}
+  - {repo: apache/commons-io, lang: java}
+  - {repo: apache/commons-collections, lang: java}
+  - {repo: apache/commons-text, lang: java}
+  - {repo: apache/kafka, lang: java}
+  - {repo: apache/lucene, lang: java}
+  - {repo: alibaba/fastjson2, lang: java}
+  - {repo: alibaba/arthas, lang: java}
+  - {repo: iluwatar/java-design-patterns, lang: java}
+  - {repo: TheAlgorithms/Java, lang: java}
+  - {repo: bumptech/glide, lang: java}
+  - {repo: square/picasso, lang: java}
+  - {repo: square/javapoet, lang: java}
+  - {repo: square/moshi, lang: java}
+  - {repo: jhy/jsoup, lang: java}
+  - {repo: apache/poi, lang: java}
+  - {repo: jOOQ/jOOQ, lang: java}
+  - {repo: hibernate/hibernate-orm, lang: java}
+  - {repo: mybatis/mybatis-3, lang: java}
+  - {repo: apache/zookeeper, lang: java}
+  - {repo: apache/cassandra, lang: java}
+  - {repo: ben-manes/caffeine, lang: java}
+  - {repo: apache/maven, lang: java}
+  - {repo: gradle/gradle, lang: java}
+  - {repo: checkstyle/checkstyle, lang: java}
+  - {repo: spotbugs/spotbugs, lang: java}
+  - {repo: pmd/pmd, lang: java}
+  - {repo: javaparser/javaparser, lang: java}
+  - {repo: antlr/antlr4, lang: java}
+  - {repo: apache/groovy, lang: java}
+  - {repo: apache/logging-log4j2, lang: java}
+  - {repo: qos-ch/logback, lang: java}
+  - {repo: qos-ch/slf4j, lang: java}
+  - {repo: projectlombok/lombok, lang: java}
+  - {repo: apache/rocketmq, lang: java}
+  - {repo: xerial/snappy-java, lang: java}
+  - {repo: apache/calcite, lang: java}
+  - {repo: apache/avro, lang: java}
+  - {repo: apache/parquet-java, lang: java}
+  - {repo: apache/pdfbox, lang: java}
+  - {repo: libgdx/libgdx, lang: java}
+  - {repo: processing/processing4, lang: java}
+  - {repo: jenkinsci/jenkins, lang: java}
+  - {repo: apache/jmeter, lang: java}
+  - {repo: zxing/zxing, lang: java}
+  - {repo: EngineHub/WorldEdit, lang: java}
+  - {repo: apache/flink, lang: java}
+  - {repo: apache/skywalking, lang: java}
+  - {repo: apache/druid, lang: java}
+  - {repo: apache/pinot, lang: java}
+  # ---------------------------------------------------------------- javascript
+  - {repo: expressjs/express, lang: javascript}
+  - {repo: lodash/lodash, lang: javascript}
+  - {repo: facebook/react, lang: javascript}
+  - {repo: vuejs/vue, lang: javascript}
+  - {repo: jquery/jquery, lang: javascript}
+  - {repo: d3/d3, lang: javascript}
+  - {repo: mrdoob/three.js, lang: javascript}
+  - {repo: moment/moment, lang: javascript}
+  - {repo: webpack/webpack, lang: javascript}
+  - {repo: babel/babel, lang: javascript}
+  - {repo: eslint/eslint, lang: javascript}
+  - {repo: prettier/prettier, lang: javascript}
+  - {repo: mochajs/mocha, lang: javascript}
+  - {repo: chaijs/chai, lang: javascript}
+  - {repo: sinonjs/sinon, lang: javascript}
+  - {repo: koajs/koa, lang: javascript}
+  - {repo: fastify/fastify, lang: javascript}
+  - {repo: hapijs/hapi, lang: javascript}
+  - {repo: sequelize/sequelize, lang: javascript}
+  - {repo: Automattic/mongoose, lang: javascript}
+  - {repo: knex/knex, lang: javascript}
+  - {repo: gulpjs/gulp, lang: javascript}
+  - {repo: gruntjs/grunt, lang: javascript}
+  - {repo: browserify/browserify, lang: javascript}
+  - {repo: pugjs/pug, lang: javascript}
+  - {repo: handlebars-lang/handlebars.js, lang: javascript}
+  - {repo: janl/mustache.js, lang: javascript}
+  - {repo: markedjs/marked, lang: javascript}
+  - {repo: markdown-it/markdown-it, lang: javascript}
+  - {repo: highlightjs/highlight.js, lang: javascript}
+  - {repo: PrismJS/prism, lang: javascript}
+  - {repo: twbs/bootstrap, lang: javascript}
+  - {repo: foundation/foundation-sites, lang: javascript}
+  - {repo: phaserjs/phaser, lang: javascript}
+  - {repo: hakimel/reveal.js, lang: javascript}
+  - {repo: impress/impress.js, lang: javascript}
+  - {repo: Leaflet/Leaflet, lang: javascript}
+  - {repo: videojs/video.js, lang: javascript}
+  - {repo: mozilla/pdf.js, lang: javascript}
+  - {repo: naptha/tesseract.js, lang: javascript}
+  - {repo: paperjs/paper.js, lang: javascript}
+  - {repo: svg/svgo, lang: javascript}
+  - {repo: lovell/sharp, lang: javascript}
+  - {repo: Automattic/node-canvas, lang: javascript}
+  - {repo: chalk/chalk, lang: javascript}
+  - {repo: yargs/yargs, lang: javascript}
+  - {repo: tj/commander.js, lang: javascript}
+  - {repo: SBoudrias/Inquirer.js, lang: javascript}
+  - {repo: sindresorhus/ora, lang: javascript}
+  - {repo: debug-js/debug, lang: javascript}
+  - {repo: winstonjs/winston, lang: javascript}
+  - {repo: pinojs/pino, lang: javascript}
+  - {repo: remy/nodemon, lang: javascript}
+  - {repo: Unitech/pm2, lang: javascript}
+  - {repo: standard/standard, lang: javascript}
+  - {repo: ramda/ramda, lang: javascript}
+  - {repo: jashkenas/underscore, lang: javascript}
+  - {repo: jashkenas/backbone, lang: javascript}
+  - {repo: emberjs/ember.js, lang: javascript}
+  - {repo: preactjs/preact, lang: javascript}
+  - {repo: alpinejs/alpine, lang: javascript}
+  - {repo: jquery/jquery-ui, lang: javascript}
+  - {repo: select2/select2, lang: javascript}
+  - {repo: Semantic-Org/Semantic-UI, lang: javascript}
+  - {repo: josdejong/mathjs, lang: javascript}
+  - {repo: hapijs/joi, lang: javascript}
+  - {repo: validatorjs/validator.js, lang: javascript}
+  - {repo: moment/luxon, lang: javascript}
+  - {repo: iamkun/dayjs, lang: javascript}
+  - {repo: hexojs/hexo, lang: javascript}
+  - {repo: 11ty/eleventy, lang: javascript}
+  - {repo: docsifyjs/docsify, lang: javascript}
+  - {repo: cytoscape/cytoscape.js, lang: javascript}
+  - {repo: jsdom/jsdom, lang: javascript}
+  - {repo: nightwatchjs/nightwatch, lang: javascript}
+  - {repo: karma-runner/karma, lang: javascript}
+  - {repo: qunitjs/qunit, lang: javascript}
+  - {repo: avajs/ava, lang: javascript}
+  - {repo: jasmine/jasmine, lang: javascript}
+  - {repo: nodeca/pako, lang: javascript}
+  - {repo: jprichardson/node-fs-extra, lang: javascript}
+  - {repo: pouchdb/pouchdb, lang: javascript}
+  - {repo: mysqljs/mysql, lang: javascript}
+  - {repo: brianc/node-postgres, lang: javascript}
+  - {repo: meteor/meteor, lang: javascript}
+  - {repo: Dogfalo/materialize, lang: javascript}
+
+# Ключевые слова домена protected/hard_neg (сравнение по словам, регистр не важен; слова длиной
+# >= 4 символов ищутся и как подстроки, напр. "crypto" -> "cryptography", "cryptopp").
+domain_keywords:
+  - security
+  - secure
+  - crypto
+  - cryptography
+  - cipher
+  - encryption
+  - encrypt
+  - decrypt
+  - openssl
+  - boringssl
+  - libressl
+  - wolfssl
+  - mbedtls
+  - tls
+  - ssl
+  - ssh
+  - vpn
+  - wireguard
+  - ipsec
+  - firewall
+  - intrusion
+  - ids
+  - ips
+  - pcap
+  - packet
+  - sniffer
+  - netfilter
+  - iptables
+  - nftables
+  - proxy
+  - tunnel
+  - certificate
+  - certificates
+  - pki
+  - x509
+  - dns
+  - dpi
+  - pentest
+  - exploit
+  - malware
+  - forensic
+  - forensics
+  - password
+  - passwords
+  - vault
+  - hashing
+  - keychain
+  - mitm
+  - tcpdump
+  - snort
+  - suricata
+  - zeek
