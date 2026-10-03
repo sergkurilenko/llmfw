@@ -17,6 +17,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 from smcode.semantic.ann import ANN, l2_normalize
+from smcode.semantic.model import encoder_model_key, expected_model_key, model_key
 from smcode.types import FunctionRecord, QueryResult
 
 log = logging.getLogger(__name__)
@@ -126,24 +127,27 @@ class SemanticIndex(BaseIndex):
         self.use_faiss = scfg.get("use_faiss", None)
         self.index_fp16 = bool(scfg.get("index_fp16", True))
         self.checkpoint = scfg.get("checkpoint")
-        self.model_name = str(scfg.get("checkpoint") or scfg.get("base_model") or "")
+        self.model_name = expected_model_key(cfg)  # model_key модели, которую загрузит load_encoder
 
     # --- энкодер (torch, лениво)
 
     @property
     def encoder(self) -> Any:
-        """Энкодер запросов (CodeEncoder/OwnEncoder); загружается при первом обращении (нужен torch)."""
+        """Энкодер запросов (CodeEncoder/OwnEncoder); загружается при первом обращении (нужен torch).
+        ValueError, если включена own_small_model, но cfg.semantic.checkpoint не задан (иначе молча грузился бы HF-базис)."""
         if self._encoder is None:
             from smcode.semantic.model import load_encoder
 
             own = bool((self.cfg.get("semantic", {}).get("own_small_model", {}) or {}).get("enabled", False))
-            self._encoder = load_encoder(self.cfg, self.checkpoint, own_model=own and bool(self.checkpoint))
-            self.model_name = getattr(self._encoder, "model_name", self.model_name)
+            if own and not self.checkpoint:
+                raise ValueError("semantic.own_small_model.enabled requires semantic.checkpoint (runs/<name>/best of scripts/05_train_encoder.py --own_model)")
+            self._encoder = load_encoder(self.cfg, self.checkpoint, own_model=own)
+            self.model_name = encoder_model_key(self._encoder) or self.model_name
         return self._encoder
 
     def set_encoder(self, encoder: Any) -> None:
         self._encoder = encoder
-        self.model_name = getattr(encoder, "model_name", self.model_name)
+        self.model_name = encoder_model_key(encoder) or self.model_name
 
     @property
     def dim(self) -> int:
@@ -152,46 +156,58 @@ class SemanticIndex(BaseIndex):
     # --- построение
 
     def build(self, records: Iterable[FunctionRecord], cfg: dict[str, Any]) -> None:
-        """Кодирует записи (или берёт готовые эмбеддинги сплита) и строит индекс."""
-        from smcode.semantic.embed import embeddings_for_records
+        """Кодирует записи (или берёт готовые эмбеддинги сплита той же модели) и строит индекс.
+        meta.model — модель, которой получены векторы (переиспользуются только векторы ожидаемой модели).
+        Окна (kind == window) ищутся в файле <split>_windows.npz (embed.windows_split), функции — в <split>.npz."""
+        from smcode.semantic.embed import embeddings_for_records_ex, windows_split
 
         self._configure(cfg)
+        if self._encoder is not None:  # явно заданный энкодер важнее cfg
+            self.model_name = encoder_model_key(self._encoder) or self.model_name
         recs = list(iter_records(records))
         t0 = time.perf_counter()
         ids = [r.id for r in recs]
         codes = [r.code for r in recs]
         langs = [r.lang for r in recs]
-        splits = {r.split for r in recs}
+        groups = [windows_split(r.split) if (r.kind or "function") == "window" else r.split for r in recs]
+        splits = set(groups)
         emb = np.zeros((len(recs), 0), dtype=np.float32)
+        n_reused = n_encoded = 0
+        sources: list[str] = []
         if recs:
-            if len(splits) == 1:
-                emb = embeddings_for_records(cfg, lambda: self.encoder, ids, codes, langs, split=next(iter(splits)))
-            else:  # смесь сплитов (например, protected + окна): по сплитам
-                parts = []
-                for s in sorted(splits):
-                    sel = [i for i, r in enumerate(recs) if r.split == s]
-                    e = embeddings_for_records(cfg, lambda: self.encoder, [ids[i] for i in sel], [codes[i] for i in sel],
-                                               [langs[i] for i in sel], split=s)
-                    parts.append((sel, e))
-                d = parts[0][1].shape[1]
-                emb = np.zeros((len(recs), d), dtype=np.float32)
-                for sel, e in parts:
-                    emb[sel] = e
+            parts = []
+            for s in sorted(splits):
+                sel = [i for i, g in enumerate(groups) if g == s]
+                e, info = embeddings_for_records_ex(cfg, lambda: self.encoder, [ids[i] for i in sel], [codes[i] for i in sel],
+                                                    [langs[i] for i in sel], split=s, model=self.model_name)
+                n_reused += int(info["n_reused"])
+                n_encoded += int(info["n_encoded"])
+                if info.get("source"):
+                    sources.append(str(info["source"]))
+                parts.append((sel, e))
+            d = parts[0][1].shape[1]
+            emb = np.zeros((len(recs), d), dtype=np.float32)
+            for sel, e in parts:
+                emb[sel] = e
         self.build_from_embeddings(ids, emb, meta={"model": self.model_name, "build_seconds": round(time.perf_counter() - t0, 3),
-                                                   "splits": sorted(splits)})
+                                                   "splits": sorted(splits), "n_reused": n_reused, "n_encoded": n_encoded,
+                                                   "embeddings_sources": sources})
 
     def build_from_embeddings(self, ids: Sequence[str], matrix: np.ndarray, meta: dict[str, Any] | None = None) -> None:
-        """numpy-путь: ids + матрица (N, d) → нормировка → ANN. Используется eval/privacy и load()."""
+        """numpy-путь: ids + матрица (N, d) → нормировка → ANN. Используется eval/privacy и load().
+        meta['model'] (если задан) становится моделью индекса (model_name)."""
         ids = list(ids)
         matrix = np.asarray(matrix, dtype=np.float32)
         if matrix.ndim != 2 or matrix.shape[0] != len(ids):
             raise ValueError(f"matrix shape {matrix.shape} does not match {len(ids)} ids")
+        if meta and meta.get("model"):
+            self.model_name = model_key(meta["model"])
         self._reset()
         self.ids = ids
         self.matrix = l2_normalize(matrix) if matrix.size else np.zeros((0, matrix.shape[1] if matrix.ndim == 2 else 0), np.float32)
         self.ann = ANN(self.matrix, use_faiss=self.use_faiss)
         self.meta = {"dim": self.dim, "n_records": len(ids), "ann_backend": self.ann.backend, "top_k": self.top_k,
-                     "model": self.model_name, **(meta or {})}
+                     **(meta or {}), "model": self.model_name}
         log.info("semantic: %d vectors (d=%d), ann=%s", len(ids), self.dim, self.ann.backend)
 
     # --- оценка
@@ -259,7 +275,7 @@ class SemanticIndex(BaseIndex):
         ids = list(self.ids)
         meta = dict(self.meta)
         p = state.get("params", {}) or {}
-        self.model_name = p.get("model", self.model_name)
+        self.model_name = model_key(p.get("model")) or self.model_name
         m = np.asarray(state["matrix"], dtype=np.float32)
         if m.ndim != 2:
             m = m.reshape(len(ids), -1) if len(ids) else np.zeros((0, 0), np.float32)

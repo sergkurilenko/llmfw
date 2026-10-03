@@ -22,7 +22,7 @@ from smcode.types import TransformResult
 
 log = logging.getLogger(__name__)
 
-_MAX_TRIES = 12
+_MAX_TRIES = 24  # окон-кандидатов на проверку разбираемости; если ни одно не разбирается — берётся первое (parses=False)
 
 
 def _statement_rows(p: Parsed, body) -> tuple[set[int], set[int]]:
@@ -48,7 +48,8 @@ def _window_text(lines: list[str], start: int, L: int) -> str:
 
 def partial(code: str, lang: str, rng: random.Random, L: int = 5, **params: Any) -> TransformResult:
     """Окно из L подряд идущих непустых строк тела. Кандидаты: выровненные по началу и концу оператора,
-    затем по началу, затем любые; среди них предпочитается разбираемый фрагмент."""
+    затем по началу, затем любые; среди них предпочитается разбираемый фрагмент. Неразбираемое окно
+    (сценарий IDE-вставки) тоже принимается — с ``params.parses == False``; registry его не отбрасывает."""
     lang = canon_lang(lang)
     L = int(L)
     if L <= 0:

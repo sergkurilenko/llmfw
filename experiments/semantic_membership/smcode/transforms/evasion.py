@@ -18,15 +18,27 @@ from smcode.types import TransformResult
 
 log = logging.getLogger(__name__)
 
-# Шаблоны no-op операторов; {k} — уникальный номер вставки.
+# Шаблоны no-op операторов; {k} — уникальный номер вставки. Набор "train" — позитивы дообучения энкодера и
+# комбинатора (train.py, hybrid.combiner_training_queries); набор "eval" — наборы запросов оценки (build_queries,
+# cfg.transforms.deadcode_templates), чтобы генератор атаки на оценке не совпадал с генератором обучения.
 DEADCODE_TEMPLATES: dict[str, tuple[str, ...]] = {
     "python": ("_tmp_{k} = 0", "_tmp_{k} = None", "_tmp_{k} = []"),
     "c": ("int _tmp_{k} = 0; (void)_tmp_{k};", "do {{ }} while (0);", "(void)0;"),
-    "cpp": ("int _tmp_{k} = 0; (void)_tmp_{k};", "do {{ }} while (0);", "(void)0;"),
+    # C++: объявление в собственном блоке — goto через инициализацию ill-formed (в C допустимо)
+    "cpp": ("{{ int _tmp_{k} = 0; (void)_tmp_{k}; }}", "do {{ }} while (0);", "(void)0;"),
     "go": ("_ = 0", "var _tmp_{k} int; _ = _tmp_{k}", "_ = \"\""),
     "java": ("int _tmp_{k} = 0;", "long _tmp_{k} = 0L;", "boolean _tmp_{k} = false;"),
     "javascript": ("void 0;", "let _tmp_{k} = 0;", "const _tmp_{k} = null;"),
 }
+DEADCODE_TEMPLATES_EVAL: dict[str, tuple[str, ...]] = {
+    "python": ("if False: pass", "assert True", "_unused_{k} = 1 + 1"),
+    "c": ("if (0) {{ }}", "{{ }}", "while (0) {{ }}"),
+    "cpp": ("if (0) {{ }}", "{{ }}", "static_cast<void>(0);"),
+    "go": ("if false {{ }}", "{{ }}", "_ = 1 + 1"),
+    "java": ("if (false) {{ }}", "{{ }}", "assert true;"),
+    "javascript": ("if (false) {{ }}", "{{ }}", "null;"),
+}
+TEMPLATE_SETS: dict[str, dict[str, tuple[str, ...]]] = {"train": DEADCODE_TEMPLATES, "eval": DEADCODE_TEMPLATES_EVAL}
 
 # Узлы, внутри которых переставлять операторы небезопасно (вызовы, побочные эффекты).
 _UNSAFE_TYPES = {
@@ -49,10 +61,19 @@ _SIMPLE_TYPES: dict[str, set[str]] = {
 }
 _ASSIGN_TYPES = {"assignment", "augmented_assignment", "assignment_expression", "augmented_assignment_expression"}
 _ID_LIKE = {
-    "identifier", "field_identifier", "property_identifier", "type_identifier", "shorthand_property_identifier",
-    "shorthand_property_identifier_pattern", "statement_identifier", "namespace_identifier", "label_name",
-    "this", "self", "super",
+    "identifier", "field_identifier", "property_identifier", "shorthand_property_identifier",
+    "shorthand_property_identifier_pattern", "statement_identifier", "label_name", "this", "self", "super",
 }
+# Поддеревья типов и литералы-ключевые слова: не идентификаторы данных, общность по ним не мешает перестановке
+# (`int x = a; int y = b;` независимы).
+_TYPE_NODE_TYPES = {
+    "primitive_type", "type_identifier", "sized_type_specifier", "struct_specifier", "union_specifier",
+    "enum_specifier", "template_type", "qualified_type", "generic_type", "type_descriptor", "integral_type",
+    "floating_point_type", "boolean_type", "void_type", "array_type", "map_type", "slice_type", "channel_type",
+    "function_type", "pointer_type", "scoped_type_identifier", "type_arguments", "placeholder_type_specifier",
+    "namespace_identifier", "type_qualifier", "storage_class_specifier", "type",  # type — аннотация python
+}
+_LITERAL_KW_TYPES = {"true", "false", "null", "nil", "none", "nullptr", "undefined", "null_literal"}
 
 
 def _first_on_line(p: Parsed, node) -> str | None:
@@ -76,21 +97,26 @@ def _iter_blocks(p: Parsed):
 
 
 def insert_deadcode(code: str, lang: str, rng: random.Random, **params: Any) -> TransformResult:
-    """Вставка синтаксически корректных no-op операторов каждые ``every`` строк тела (минимум одна)."""
+    """Вставка синтаксически корректных no-op операторов каждые ``every`` строк тела (минимум одна).
+    ``template_set`` ∈ {train, eval} (по умолчанию train) выбирает набор шаблонов (TEMPLATE_SETS)."""
     lang = canon_lang(lang)
     every = int(params.get("every", 3))
+    template_set = str(params.get("template_set") or "train")
+    if template_set not in TEMPLATE_SETS:
+        raise ValueError(f"unknown dead-code template set {template_set!r}; known: {sorted(TEMPLATE_SETS)}")
     p = parse_code(code, lang)
     candidates: list[tuple[int, int, str]] = []  # (row, byte, indent)
     for block in _iter_blocks(p):
         for st in _block_statements(p, block):
-            if st.type in ("case_statement",):
+            # перед меткой case и перед super(...)/this(...) в конструкторе Java вставлять нельзя
+            if st.type in ("case_statement", "explicit_constructor_invocation"):
                 continue
             indent = _first_on_line(p, st)
             if indent is None:
                 continue
             candidates.append((st.start_point[0], st.start_byte, indent))
     if not candidates:
-        return TransformResult.failed("insert_deadcode", {"every": every})
+        return TransformResult.failed("insert_deadcode", {"every": every, "template_set": template_set})
     candidates.sort()
     # дедупликация по байту
     uniq: list[tuple[int, int, str]] = []
@@ -108,21 +134,24 @@ def insert_deadcode(code: str, lang: str, rng: random.Random, **params: Any) -> 
             last_row = row
     if not chosen:
         chosen = [rng.choice(uniq)]
-    templates = DEADCODE_TEMPLATES[lang]
+    templates = TEMPLATE_SETS[template_set][lang]
     edits: list[tuple[int, int, bytes]] = []
     for k, (_, b, ind) in enumerate(chosen, start=1):
         stmt = rng.choice(templates).format(k=k)
         edits.append((b, b, (stmt + "\n" + ind).encode("utf-8")))
     out = p.unwrap(apply_edits(p.src, edits))
     return TransformResult(code=out, name="insert_deadcode",
-                           params={"every": every, "n_inserted": len(chosen)}, ok=True)
+                           params={"every": every, "n_inserted": len(chosen), "template_set": template_set}, ok=True)
 
 
 def _ids_of(p: Parsed, node) -> set[str]:
+    """Идентификаторы данных в поддереве (без имён типов и литералов true/false/null)."""
     out: set[str] = set()
     stack = [node]
     while stack:
         n = stack.pop()
+        if n.type in _TYPE_NODE_TYPES or n.type in _LITERAL_KW_TYPES:
+            continue
         if n.type in _ID_LIKE or (n.child_count == 0 and n.is_named and p.text(n)[:1].isalpha()):
             out.add(p.text(n))
         stack.extend(n.children)

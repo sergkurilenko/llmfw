@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import random
 import subprocess
 import sys
@@ -362,13 +363,16 @@ def test_build_queries_tiny(tmp_path):
 
     cfg = _tiny_cfg(tmp_path)
     fdir = tmp_path / "functions"
-    write_jsonl(fdir / "protected.jsonl", [_rec("protected", i, l) for i, l in enumerate(LANGS)]
-                + [_rec("protected", 99, "python", kind="window")])
+    # раскладка модуля данных: окна лежат в отдельном файле protected_windows.jsonl (kind == window)
+    write_jsonl(fdir / "protected.jsonl", [_rec("protected", i, l) for i, l in enumerate(LANGS)])
+    write_jsonl(fdir / "protected_windows.jsonl", [_rec("protected", 99, "python", kind="window"),
+                                                   _rec("protected", 98, "c", kind="window")])
     write_jsonl(fdir / "public_calib.jsonl", [_rec("public_calib", i, l) for i, l in enumerate(LANGS[:2])])
     res = build_queries(cfg)
     assert set(res) == set(ALL_SETS)
     assert res["hard_neg"] == 0 and res["public_test"] == 0  # нет файлов функций
     assert res["protected"] > 0 and res["public_calib"] > 0 and res["protected_windows"] > 0
+    assert not list((tmp_path / "queries").glob("*.tmp"))  # атомарная запись не оставляет временных файлов
 
     rows = list(read_jsonl(tmp_path / "queries" / "protected.jsonl"))
     assert len(rows) == res["protected"]
@@ -399,6 +403,7 @@ def test_build_queries_tiny(tmp_path):
     win = list(read_jsonl(tmp_path / "queries" / "protected_windows.jsonl"))
     assert win and all(r["label"] == 1 and r["set"] == "protected_windows" for r in win)
     assert {r["transform"] for r in win} == {"identity", "partial"}
+    assert {r["source_id"] for r in win} == {_rec("protected", 99, "python").id, _rec("protected", 98, "c").id}
     stats = json.loads((tmp_path / "queries" / "protected.stats.json").read_text())
     assert stats["n_queries"] == res["protected"] and stats["per_transform"]["identity"]["ok"] == 6
 
@@ -443,3 +448,237 @@ def test_llm_extract_and_validate():
     assert msgs[0]["role"] == "system" and "Go" in msgs[1]["content"] and "```go" in msgs[1]["content"]
     msgs = llm_paraphrase.paraphrase_messages(SAMPLES["java"], "java")
     assert "Java" in msgs[1]["content"] and SAMPLES["java"].rstrip() in msgs[1]["content"]
+
+
+# --------------------------------------------------------------------------- регрессии после ревью
+
+
+def test_windows_fallback_to_protected_jsonl(tmp_path):
+    """Без protected_windows.jsonl окна берутся из protected.jsonl (kind == window)."""
+    from smcode.eval.build_queries import build_queries, functions_path
+
+    cfg = _tiny_cfg(tmp_path)
+    fdir = tmp_path / "functions"
+    write_jsonl(fdir / "protected.jsonl", [_rec("protected", 0, "python"), _rec("protected", 99, "go", kind="window")])
+    assert functions_path(cfg, "protected_windows") == fdir / "protected.jsonl"
+    res = build_queries(cfg, splits=["protected", "protected_windows"])
+    assert res["protected"] > 0 and res["protected_windows"] > 0
+    win = list(read_jsonl(tmp_path / "queries" / "protected_windows.jsonl"))
+    assert {r["source_id"] for r in win} == {_rec("protected", 99, "go").id}
+    prot = list(read_jsonl(tmp_path / "queries" / "protected.jsonl"))
+    assert {r["source_id"] for r in prot} == {_rec("protected", 0, "python").id}  # окно в protected не попадает
+    write_jsonl(fdir / "protected_windows.jsonl", [_rec("protected", 98, "c", kind="window")])
+    assert functions_path(cfg, "protected_windows") == fdir / "protected_windows.jsonl"
+
+
+def test_build_set_treats_empty_file_as_missing(tmp_path):
+    from smcode.eval.build_queries import build_queries
+
+    cfg = _tiny_cfg(tmp_path)
+    write_jsonl(tmp_path / "functions" / "public_calib.jsonl", [_rec("public_calib", 0, "c")])
+    res = build_queries(cfg, splits=["public_calib"])
+    assert res["public_calib"] > 0
+    out = tmp_path / "queries" / "public_calib.jsonl"
+    out.write_text("")  # прерванная запись
+    assert build_queries(cfg, splits=["public_calib"])["public_calib"] == res["public_calib"]
+    assert out.stat().st_size > 0
+    assert build_queries(cfg, splits=["public_calib"]) == {"public_calib": -1}
+    stats = json.loads((tmp_path / "queries" / "public_calib.stats.json").read_text())
+    assert "partial@3" in stats["per_transform"]
+
+
+class _FakeEngine:
+    """Подмена LLMEngine без vllm: paraphrase → rename_ids исходника, translate → образец на целевом языке."""
+
+    model, seed, temperature = "fake", 1, 0.0
+
+    def __init__(self, echo: bool = False) -> None:
+        self.echo = echo
+        self.n_calls = 0
+
+    def generate(self, conversations):
+        self.n_calls += 1
+        out = []
+        for conv in conversations:
+            user = conv[-1]["content"]
+            code = llm_paraphrase.extract_code(user)
+            tag = re.search(r"in a ```(\w+) block", user).group(1)
+            if self.echo:
+                out.append(f"```{tag}\n{code}```")
+            elif user.startswith("Translate"):
+                out.append(f"```{tag}\n{SAMPLES[tag]}```")
+            else:
+                r = apply_transform("rename_ids", code, tag, random.Random(0), style="vn")
+                out.append(f"Sure:\n```{tag}\n{r.code}```")
+        return out
+
+
+def test_llm_queries_subset_of_programmatic_sample(tmp_path):
+    from smcode.eval.build_queries import build_queries
+    from smcode.transforms.llm_paraphrase import build_llm_queries
+
+    cfg = _tiny_cfg(tmp_path)
+    cfg["transforms"]["llm"] = ["paraphrase", "translate"]
+    recs = [_rec("protected", i, LANGS[i % 6]) for i in range(12)]
+    write_jsonl(tmp_path / "functions" / "protected.jsonl", recs)
+    # без программных строк — отказ (0), файл не создаётся
+    eng = _FakeEngine()
+    assert build_llm_queries(cfg, splits=["protected"], sample=2, engine=eng) == {"protected": 0}
+    assert not (tmp_path / "queries" / "protected.jsonl").exists() and eng.n_calls == 0
+
+    assert build_queries(cfg, splits=["protected"], max_per_split=5)["protected"] > 0
+    prog_ids = {r["source_id"] for r in read_jsonl(tmp_path / "queries" / "protected.jsonl")}
+    assert len(prog_ids) == 5
+    res = build_llm_queries(cfg, splits=["protected"], sample=3, engine=eng)
+    assert res["protected"] == 6  # 3 функции × (paraphrase + translate)
+    rows = list(read_jsonl(tmp_path / "queries" / "protected.jsonl"))
+    llm = [r for r in rows if r["transform"] in ("paraphrase", "translate")]
+    assert len(llm) == 6 and {r["source_id"] for r in llm} <= prog_ids
+    assert len({r["source_id"] for r in llm}) == 3
+    assert len([r for r in rows if r["transform"] not in ("paraphrase", "translate")]) == len(rows) - 6
+    for r in llm:
+        assert r["label"] == 1 and r["qid"] == f"{r['source_id']}#{r['transform']}#0"
+        assert r["params"]["model"] == "fake" and r["params"]["prompt_id"].startswith(r["transform"])
+        if r["transform"] == "translate":
+            assert r["lang"] == r["params"]["dst_lang"] != r["params"]["src_lang"]
+            assert llm_paraphrase.lang_family(r["lang"]) != llm_paraphrase.lang_family(r["params"]["src_lang"])
+        else:
+            assert r["lang"] == r["params"]["src_lang"]
+        assert parses_ok(r["code"], r["lang"]) and r["n_tokens"] == count_tokens(r["code"], r["lang"])
+    stats = json.loads((tmp_path / "queries" / "protected.llm_stats.json").read_text())
+    assert stats["paraphrase_ok"] == 3 and stats["translate_ok"] == 3 and stats["n_programmatic_sources"] == 5
+    assert sum(stats["translate_pairs"].values()) == 3
+    # идемпотентность и детерминизм
+    assert build_llm_queries(cfg, splits=["protected"], sample=3, engine=eng) == {"protected": -1}
+    assert build_llm_queries(cfg, splits=["protected"], sample=3, engine=eng, force=True) == {"protected": 6}
+    assert list(read_jsonl(tmp_path / "queries" / "protected.jsonl")) == rows
+    assert not list((tmp_path / "queries").glob("*.tmp"))
+
+
+def test_translate_rejects_echo_and_same_family():
+    cfg = {"transforms": {}}
+    rng = random.Random(0)
+    for src in ("c", "cpp"):
+        assert {llm_paraphrase.pick_dst_lang(src, LANGS, rng) for _ in range(30)} == {"python", "go", "java", "javascript"}
+    assert {llm_paraphrase.pick_dst_lang("go", ["go", "c"], rng) for _ in range(5)} == {"c"}
+    # эхо исходника (C → C++ один в один / только переименование) не принимается
+    res = llm_paraphrase.translate_batch([SAMPLES["c"]], ["c"], ["cpp"], cfg, engine=_FakeEngine(echo=True))
+    assert len(res) == 1 and not res[0].ok and res[0].params["dst_lang"] == "cpp"
+    renamed = apply_transform("rename_ids", SAMPLES["c"], "c", random.Random(1), style="vn").code
+    assert not llm_paraphrase.validate_output(renamed, "cpp", original=SAMPLES["c"], original_lang="c",
+                                              reject_same_abstract=True)
+    assert llm_paraphrase.validate_output(renamed, "c", original=SAMPLES["c"])  # для paraphrase переименование — ок
+    res = llm_paraphrase.translate_batch([SAMPLES["c"]], ["c"], ["go"], cfg, engine=_FakeEngine())
+    assert res[0].ok and res[0].code == SAMPLES["go"] and res[0].params["src_lang"] == "c"
+    res = llm_paraphrase.paraphrase_batch([SAMPLES["java"]], ["java"], cfg, engine=_FakeEngine())
+    assert res[0].ok and res[0].code != SAMPLES["java"] and _abstract(res[0].code, "java") == _abstract(SAMPLES["java"], "java")
+
+
+def test_rename_ids_go_keyed_element_keys():
+    """Ключи структурного литерала — имена полей (не переименовываются); ключи map-литерала — выражения."""
+    code = ("func newConn(fd int, name string) *conn {\n"
+            "\tc := &conn{fd: fd, name: name}\n"
+            "\tm := map[string]int{name: fd}\n"
+            "\ts := []conn{{fd: fd}}\n"
+            "\tmm := map[string]conn{name: {fd: fd}}\n"
+            "\treturn c\n}\n")
+    r = apply_transform("rename_ids", code, "go", random.Random(0), style="vn")
+    assert r.ok and parses_ok(r.code, "go")
+    m = r.params["mapping"]
+    fd, name = m["fd"], m["name"]
+    assert f"&conn{{fd: {fd}, name: {name}}}" in r.code
+    assert f"map[string]int{{{name}: {fd}}}" in r.code
+    assert f"[]conn{{{{fd: {fd}}}}}" in r.code
+    assert f"map[string]conn{{{name}: {{fd: {fd}}}}}" in r.code
+    assert _abstract(r.code, "go") == _abstract(code, "go")
+
+
+def test_python_empty_blocks_rejected():
+    from smcode.transforms.programmatic import parses_ok as ok
+
+    assert not ok("def f(a):\n", "python") and not ok("x = 1\ntry:\n", "python")
+    assert not ok("try:\n    x = 1\nexcept (TypeError, ValueError):\n", "python")
+    assert not ok("def f(a):\n    def g():\n    return g\n", "python")
+    assert not ok("    x = 0\nreturn x\n", "python")  # рассогласованный отступ (ast)
+    assert ok("x = 0\nreturn x\n", "python") and ok("def f(a):\n    return a\n", "python")
+    # функция только с docstring: strip_comments дал бы пустое тело → неприменимо; combo пропускает шаг
+    code = 'def _warn(self, n):\n    """Only a docstring."""\n'
+    assert not apply_transform("strip_comments", code, "python", random.Random(0)).ok
+    r = apply_transform("combo", code, "python", random.Random(0))
+    assert r.ok and "strip_comments" not in r.params["steps"] and "Only a docstring" in r.code and parses_ok(r.code, "python")
+    code2 = 'def f(a):\n    """Doc."""\n    return a\n'
+    assert apply_transform("strip_comments", code2, "python", random.Random(0)).code == "def f(a):\n    return a\n"
+
+
+def test_partial_unparsed_window_is_accepted_with_flag():
+    """Все окна L=3 заканчиваются/начинаются висячим заголовком → фрагмент принимается с parses=False."""
+    code = "def f(a):\n    try:\n        x = a\n    except (A, B):\n        x = 0\n    y = 1\n    return x + y\n"
+    r = apply_transform("partial", code, "python", random.Random(1), L=3)
+    assert r.ok and r.params["parses"] is False and r.params["L"] == 3
+    assert len([ln for ln in r.code.splitlines() if ln.strip()]) == 3
+    # при наличии разбираемого окна (L=2: 'y = 1 / return', L=4: весь try/except) выбирается оно
+    for L in (2, 4):
+        r2 = apply_transform("partial", code, "python", random.Random(1), L=L)
+        assert r2.ok and r2.params["parses"] is True and parses_ok(r2.code, "python"), (L, r2)
+
+
+def test_reorder_same_type_declarations():
+    code = "int f(int a, int b) {\n    int x = a;\n    int y = b;\n    return x + y;\n}\n"
+    r = apply_transform("reorder_stmts", code, "c", random.Random(0))
+    assert r.ok and r.params["n_swaps"] == 1 and r.code.index("int y = b") < r.code.index("int x = a")
+    for lang, code in (
+        ("cpp", "void f() {\n    uint32_t x = a;\n    uint32_t y = b;\n    g(x, y);\n}\n"),
+        ("go", "func f(a, b int) int {\n\tvar x int = a\n\tvar y int = b\n\treturn x + y\n}\n"),
+        ("python", "def f(a, b):\n    x = True\n    y = True\n    return x, y\n"),
+        ("java", "int f(int a, int b) {\n    int x = a;\n    int y = b;\n    return x + y;\n}\n"),
+    ):
+        r = apply_transform("reorder_stmts", code, lang, random.Random(0))
+        assert r.ok and r.params["n_swaps"] == 1 and parses_ok(r.code, lang), lang
+    # зависимость через идентификатор по-прежнему блокирует
+    assert not apply_transform("reorder_stmts", "int f(int a) {\n    int x = a;\n    int y = x;\n    return y;\n}\n",
+                               "c", random.Random(0)).ok
+
+
+def test_change_literals_chars_and_case_labels():
+    code = ("int f(char c, int a) {\n    switch (a) {\n        case 1: return 'x';\n        case 2: return 7;\n"
+            "        default: break;\n    }\n    if (c == '/' || c == '\\n') {\n        return 100;\n    }\n    return 0;\n}\n")
+    r = apply_transform("change_literals", code, "c", random.Random(0))
+    assert r.ok and "case 1:" in r.code and "case 2:" in r.code and "return 7" not in r.code
+    assert re.search(r"c == '[A-Za-z0-9]'", r.code) and "'/'" not in r.code and "'\\n'" not in r.code
+    chars = [t.text for t in tokenize(r.code, "c") if t.kind == "str" and t.text.startswith("'")]
+    assert len(chars) == 3 and all(re.fullmatch(r"'[A-Za-z0-9]'", t) for t in chars), chars  # нет многосимвольных char
+    assert _abstract(r.code, "c") == _abstract(code, "c") and parses_ok(r.code, "c")
+    java = "static int f(char c) {\n    if (c == '\\u0041') {\n        return 1;\n    }\n    return 2;\n}\n"
+    r = apply_transform("change_literals", java, "java", random.Random(0))
+    assert r.ok and re.search(r"c == '[A-Za-z0-9]'", r.code) and parses_ok(r.code, "java")
+    go = "func f(c rune, s string) int {\n\tif c == 'x' && s == \"ab\" {\n\t\treturn 1\n\t}\n\treturn 2\n}\n"
+    r = apply_transform("change_literals", go, "go", random.Random(0))
+    assert r.ok and re.search(r"c == '[A-Za-z0-9]'", r.code) and '"ab"' not in r.code and parses_ok(r.code, "go")
+
+
+def test_insert_deadcode_cpp_goto_and_java_super():
+    cpp = "int f(int a){\n    int r=0;\n    if (a<0) goto out;\n    r=a*2;\n    r+=1;\nout:\n    return r;\n}\n"
+    r = apply_transform("insert_deadcode", cpp, "cpp", random.Random(0), every=1)
+    assert r.ok and parses_ok(r.code, "cpp") and r.params["n_inserted"] >= 3
+    for ln in r.code.splitlines():
+        if "_tmp_" in ln:  # объявление только в собственном блоке: goto через инициализацию ill-formed
+            assert ln.strip().startswith("{") and ln.strip().endswith("}"), ln
+    java = "Foo(int a) {\n    super(a);\n    this.a = a;\n    this.b = 2;\n}\n"
+    r = apply_transform("insert_deadcode", java, "java", random.Random(0), every=1)
+    assert r.ok and parses_ok(r.code, "java") and r.params["n_inserted"] == 2
+    assert r.code.splitlines()[1].strip() == "super(a);"  # super(...) остаётся первым оператором
+
+
+def test_reformat_keeps_multiline_string_contents():
+    py = 's = """line1\n    line2\n        line3"""\ndef f(x):\n    y = x\n    return y\n'
+    r = apply_transform("reformat", py, "python", random.Random(0), indent="2", spaces="keep", braces="keep",
+                        join_blocks=False)
+    assert r.ok and '"""line1\n    line2\n        line3"""' in r.code and "\n  y = x\n" in r.code
+    go = "func f() string {\n\ts := `raw\n\t\tline2\n`\n\treturn s\n}\n"
+    r = apply_transform("reformat", go, "go", random.Random(0), indent="2", spaces="keep", braces="keep",
+                        join_blocks=False)
+    assert r.ok and "`raw\n\t\tline2\n`" in r.code and "\n  return s" in r.code
+    java = 'String f() {\n    String t = """\n        hello\n        """;\n    return t;\n}\n'
+    r = apply_transform("reformat", java, "java", random.Random(0), indent="2", spaces="keep", braces="keep",
+                        join_blocks=False)
+    assert r.ok and '"""\n        hello\n        """' in r.code and "\n  return t;" in r.code

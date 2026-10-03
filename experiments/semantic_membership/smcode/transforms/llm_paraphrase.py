@@ -18,14 +18,16 @@ from collections import Counter
 from typing import Any, Iterable, Sequence
 
 from smcode.config import get_rng, resolve_path
-from smcode.normalize import canon_lang, count_tokens, tokenize
+from smcode.normalize import abstract_tokens, canon_lang, count_tokens, tokenize
 from smcode.transforms.programmatic import count_lines, parses_ok
-from smcode.types import FunctionRecord, QueryRecord, TransformResult, read_jsonl, write_jsonl
+from smcode.types import FunctionRecord, QueryRecord, TransformResult, read_jsonl
 
 log = logging.getLogger(__name__)
 
 LANG_NAMES = {"python": "Python", "c": "C", "cpp": "C++", "go": "Go", "java": "Java", "javascript": "JavaScript"}
 FENCE_TAGS = {"python": "python", "c": "c", "cpp": "cpp", "go": "go", "java": "java", "javascript": "javascript"}
+# Семейства языков: перевод внутри семейства (C ↔ C++) переводом не считается — модель может вернуть копию.
+LANG_FAMILIES = {"c": "c", "cpp": "c"}
 
 PARAPHRASE_PROMPT_ID = "paraphrase_v1"
 TRANSLATE_PROMPT_ID = "translate_v1"
@@ -66,8 +68,10 @@ def extract_code(text: str) -> str:
     return t.strip("\n") + "\n" if t.strip() else ""
 
 
-def validate_output(code: str, lang: str, original: str | None = None) -> bool:
-    """Код непустой, разбирается без ошибок и (если задан оригинал) отличается от него."""
+def validate_output(code: str, lang: str, original: str | None = None, original_lang: str | None = None,
+                    reject_same_abstract: bool = False) -> bool:
+    """Код непустой, разбирается без ошибок и (если задан оригинал) отличается от него текстом;
+    с ``reject_same_abstract`` — ещё и потоком abstract(full)-токенов (эхо оригинала с другими именами)."""
     if not code or not code.strip():
         return False
     if original is not None and code.strip() == original.strip():
@@ -75,15 +79,31 @@ def validate_output(code: str, lang: str, original: str | None = None) -> bool:
     try:
         if not parses_ok(code, lang):
             return False
-        return count_tokens(code, lang) >= 3
+        if count_tokens(code, lang) < 3:
+            return False
+        if original is not None and reject_same_abstract:
+            src_lang = original_lang or lang
+            if abstract_tokens(tokenize(code, lang), "full") == abstract_tokens(tokenize(original, src_lang), "full"):
+                return False
+        return True
     except Exception:  # pragma: no cover
         return False
 
 
+def lang_family(lang: str) -> str:
+    """Семейство языка (c и cpp — одно семейство, остальные — сами по себе)."""
+    lang = canon_lang(lang)
+    return LANG_FAMILIES.get(lang, lang)
+
+
 def pick_dst_lang(src_lang: str, languages: Sequence[str], rng: random.Random) -> str:
-    """Случайный целевой язык, отличный от исходного (c↔cpp считаются разными языками)."""
-    src = canon_lang(src_lang)
-    cands = [canon_lang(l) for l in languages if canon_lang(l) != src]
+    """Случайный целевой язык из другого семейства (для c/cpp — не c и не cpp)."""
+    fam = lang_family(src_lang)
+    cands: list[str] = []
+    for l in languages:
+        c = canon_lang(l)
+        if lang_family(c) != fam and c not in cands:
+            cands.append(c)
     if not cands:
         raise ValueError("no destination language available")
     return rng.choice(cands)
@@ -185,7 +205,8 @@ def translate_batch(codes: Sequence[str], src_langs: Sequence[str], dst_langs: S
     for code, src, dst, text in zip(codes, src_langs, dst_langs, texts):
         new = extract_code(text)
         params = {**base, "src_lang": canon_lang(src), "dst_lang": canon_lang(dst)}
-        if validate_output(new, dst):
+        # эхо исходника (текстом или abstract-потоком) переводом не считается
+        if validate_output(new, dst, original=code, original_lang=src, reject_same_abstract=True):
             out.append(TransformResult(code=new, name="translate", params=params, ok=True))
         else:
             out.append(TransformResult.failed("translate", params))
@@ -209,9 +230,14 @@ def build_llm_queries(cfg: dict[str, Any], splits: Iterable[str] | None = None, 
                       force: bool = False, engine: LLMEngine | None = None,
                       batch_size: int = 256) -> dict[str, int]:
     """Добавляет LLM-запросы (paraphrase, translate) в data/queries/{set}.jsonl для наборов из
-    build_queries.QUERY_SETS. Идемпотентно: если LLM-строки уже есть и не задан force — пропуск.
-    Требует GPU и vllm; программные запросы должны быть построены заранее (иначе строит файл только из LLM-строк)."""
-    from smcode.eval.build_queries import QUERY_SETS, _load_records, label_for_set, sample_records
+    build_queries.QUERY_SETS. Идемпотентно: если LLM-строки уже есть и не задан force — пропуск (−1).
+    Функции берутся ТОЛЬКО из выборки программных запросов (source_id уже имеющихся строк файла), чтобы
+    TPR по преобразованиям сравнивались на одних и тех же функциях (DESIGN §5); при llm_sample_per_split
+    меньше выборки — стратифицированная подвыборка. Без программных строк набор пропускается с ошибкой (0):
+    сначала scripts/03_build_queries.py без --llm-only. Требует GPU и vllm."""
+    from smcode.eval.build_queries import (
+        QUERY_SETS, _is_complete, _load_records, label_for_set, sample_records, write_jsonl_atomic,
+    )
 
     tcfg = cfg.get("transforms", {})
     wanted = [t for t in tcfg.get("llm", list(LLM_SET_TRANSFORMS)) if t in LLM_SET_TRANSFORMS]
@@ -227,14 +253,22 @@ def build_llm_queries(cfg: dict[str, Any], splits: Iterable[str] | None = None, 
     result: dict[str, int] = {}
     for set_name in sets:
         path = out_dir / f"{set_name}.jsonl"
-        existing: list[dict[str, Any]] = list(read_jsonl(path)) if path.exists() else []
-        has_llm = any(r.get("transform") in LLM_SET_TRANSFORMS for r in existing)
-        if has_llm and not force:
+        all_rows: list[dict[str, Any]] = list(read_jsonl(path)) if _is_complete(path) else []
+        existing = [r for r in all_rows if r.get("transform") not in LLM_SET_TRANSFORMS]
+        if len(existing) < len(all_rows) and not force:
             log.info("skip llm %s: rows exist", set_name)
             result[set_name] = -1
             continue
-        existing = [r for r in existing if r.get("transform") not in LLM_SET_TRANSFORMS]
-        recs = _load_records(cfg, set_name)
+        if not existing:
+            log.error("llm %s: no programmatic queries in %s; build them first (03_build_queries.py without "
+                      "--llm-only)", set_name, path)
+            result[set_name] = 0
+            continue
+        prog_ids = {r.get("source_id") for r in existing if r.get("source_id")}
+        recs = [r for r in _load_records(cfg, set_name) if r.id in prog_ids]
+        if len(recs) < len(prog_ids):
+            log.warning("llm %s: %d of %d programmatic source functions not found in functions file",
+                        set_name, len(prog_ids) - len(recs), len(prog_ids))
         if not recs:
             result[set_name] = 0
             continue
@@ -257,9 +291,11 @@ def build_llm_queries(cfg: dict[str, Any], splits: Iterable[str] | None = None, 
                     stats["translate_ok" if res.ok else "translate_failed"] += 1
                     if res.ok:
                         new_rows.append(_llm_query(rec, set_name, res, label))
-        n = write_jsonl(path, [*existing, *new_rows])
+        n = write_jsonl_atomic(path, [*existing, *new_rows])
+        pairs = Counter(f"{r.params.get('src_lang')}->{r.lang}" for r in new_rows if r.transform == "translate")
         with open(out_dir / f"{set_name}.llm_stats.json", "w", encoding="utf-8") as f:
-            json.dump({"set": set_name, "n_sampled": len(sampled), "model": engine.model, **stats}, f,
+            json.dump({"set": set_name, "n_sampled": len(sampled), "n_programmatic_sources": len(prog_ids),
+                       "model": engine.model, **stats, "translate_pairs": dict(sorted(pairs.items()))}, f,
                       ensure_ascii=False, indent=2)
         log.info("llm %s: +%d rows (%s) → %s (%d rows total)", set_name, len(new_rows), dict(stats), path, n)
         result[set_name] = len(new_rows)

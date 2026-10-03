@@ -3,13 +3,20 @@
 По эмбеддингу функции предсказывается наличие каждого из V лексических идентификаторов (токены
 normalize.tokenize с kind == "id"). Словарь строится по public_train: частые идентификаторы (df > rare_df)
 по убыванию df плюс квота редких (min_df ≤ df ≤ rare_df), чтобы метрика «доля восстановленных редких
-идентификаторов» была измерима. Модель: MLP на torch (если установлен) или гребневая регрессия
-(замкнутая форма, numpy). Решающее правило: порог на каждый токен, максимизирующий F1 этого токена на
-вневыборочных скорах обучающего корпуса (ridge — точные leave-one-out скоры через рычаги h_ii; MLP — 2-кратный
-cross-fitting; decision="per_token" — иначе редкие токены никогда не предсказываются), либо один глобальный порог
-по micro-F1 на отложенной части public_train (decision="global"); decision="auto" (по умолчанию) выбирает правило
-с большим micro-F1 на валидации. В метриках: f1/precision/recall — по выбранному правилу (плюс f1_global и
-f1_per_token), rare_id_recall/precision — всегда по правилу per_token (rare_id_rule).
+идентификаторов» была измерима. Частоты df считаются по ПОЛНОМУ корпусу public_train (build_vocab(..., df=...),
+см. run.load_inputs), а не по обучающей подвыборке атакующего; токены с df = 1 исключены (необучаемы), в словарь
+попадают только токены, встречающиеся в обучающей подвыборке. Модель: MLP на torch (если установлен) или
+гребневая регрессия (замкнутая форма, numpy). Решающее правило: порог на каждый токен, максимизирующий F1 этого
+токена на вневыборочных скорах ОБУЧАЮЩИХ строк (ridge — точные leave-one-out скоры через рычаги h_ii; MLP —
+2-кратный cross-fitting; строки валидации в подборе порогов не участвуют), причём токен «стреляет» только если
+в лучшей точке отсечения precision ≥ min_precision и F1 ≥ min_f1 (по умолчанию 0.1): без этого условия
+F1-оптимальный порог токена с 2–3 положительными примерами при случайных скорах срабатывает на ~35–50 % функций и
+«восстанавливает» ~40 % редких идентификаторов на уровне случайности. Либо один глобальный порог по micro-F1 на
+отложенной части public_train (decision="global"); decision="auto" (по умолчанию) выбирает правило с большим
+micro-F1 на валидации. В метриках: f1/precision/recall — по выбранному правилу (плюс f1_global и f1_per_token),
+rare_id_recall/precision — всегда по правилу per_token (rare_id_rule) вместе с эталоном случайности
+rare_id_recall_chance (recall случайного предсказателя с той же частотой срабатываний по токенам) и
+rare_fire_rate (средняя доля функций, на которых стреляет редкий токен).
 Оценка на protected: micro precision/recall/F1 по токенам, recall редких идентификаторов, базовая линия
 «априорное предсказание» (одинаковый набор токенов для всех функций).
 """
@@ -41,6 +48,8 @@ N_THRESHOLDS = 64
 CHUNK = 1024
 COL_BLOCK = 256
 DEFAULT_THR_MEM = 4e9  # байт на матрицу скоров float16 для порогов MLP
+DEFAULT_MIN_PRECISION = 0.1  # порог на токен допускается только при precision ≥ … в точке отсечения
+DEFAULT_MIN_F1 = 0.1  # … и F1 ≥ … (защита от срабатываний на уровне случайности, см. per_token_thresholds)
 DECISIONS: tuple[str, ...] = ("auto", "per_token", "global")
 
 
@@ -78,6 +87,19 @@ def document_frequency(bags: Iterable[set[str]]) -> Counter:
     return df
 
 
+def identifier_df(codes: Sequence[str], langs: Sequence[str], show_progress: bool = False) -> Counter:
+    """Документные частоты идентификаторов по корпусу (потоково, без хранения мешков)."""
+    it: Iterable[tuple[str, str]] = zip(codes, langs)
+    if show_progress:
+        try:
+            from tqdm import tqdm
+
+            it = tqdm(it, total=len(codes), desc="identifier df", unit="fn", leave=False)
+        except ImportError:  # pragma: no cover
+            pass
+    return document_frequency(set(identifier_tokens(c, l)) for c, l in it)
+
+
 @dataclass
 class Vocab:
     """Словарь идентификаторов атаки: tokens, df (в public_train), граница редкости rare_df."""
@@ -85,6 +107,8 @@ class Vocab:
     tokens: list[str]
     df: np.ndarray
     rare_df: int = DEFAULT_RARE_DF
+    min_df: int = DEFAULT_MIN_DF
+    n_docs: int | None = None  # размер корпуса, по которому считался df
     index: dict[str, int] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -104,11 +128,13 @@ class Vocab:
         return int(self.rare_mask.sum())
 
     def to_dict(self) -> dict[str, Any]:
-        return {"tokens": list(self.tokens), "df": self.df.tolist(), "rare_df": int(self.rare_df)}
+        return {"tokens": list(self.tokens), "df": self.df.tolist(), "rare_df": int(self.rare_df), "min_df": int(self.min_df),
+                "n_docs": self.n_docs}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Vocab":
-        return cls(tokens=list(d["tokens"]), df=np.asarray(d["df"], dtype=np.int64), rare_df=int(d.get("rare_df", DEFAULT_RARE_DF)))
+        return cls(tokens=list(d["tokens"]), df=np.asarray(d["df"], dtype=np.int64), rare_df=int(d.get("rare_df", DEFAULT_RARE_DF)),
+                   min_df=int(d.get("min_df", DEFAULT_MIN_DF)), n_docs=d.get("n_docs"))
 
 
 def build_vocab(
@@ -118,14 +144,21 @@ def build_vocab(
     rare_df: int = DEFAULT_RARE_DF,
     rare_fraction: float = DEFAULT_RARE_FRACTION,
     rng: random.Random | None = None,
+    df: dict[str, int] | None = None,
+    n_docs: int | None = None,
 ) -> Vocab:
     """Словарь из top-частых идентификаторов (df > rare_df) и квоты редких (min_df ≤ df ≤ rare_df).
 
-    Квота редких — rare_fraction·max_size (случайная выборка с rng; при rng=None — первые по (−df, токен)).
-    Если частых меньше, чем их доля, остаток заполняется редкими, и наоборот.
+    bags — мешки обучающей подвыборки атакующего; df — документные частоты по полному корпусу public_train
+    (DESIGN §9: «редкий» = df ≤ rare_df в public); при df=None частоты считаются по bags. В словарь попадают
+    только токены, встречающиеся хотя бы в одном обучающем мешке (иначе их нельзя выучить). Токены с df < min_df
+    (по умолчанию df = 1) исключены. Квота редких — rare_fraction·max_size (случайная выборка с rng; при rng=None —
+    первые по (−df, токен)). Если частых меньше, чем их доля, остаток заполняется редкими, и наоборот.
     """
-    df = document_frequency(bags)
-    items = [(t, c) for t, c in df.items() if c >= min_df]
+    present = document_frequency(bags)
+    if df is None:
+        df, n_docs = present, len(bags)
+    items = [(t, int(c)) for t, c in df.items() if c >= min_df and present.get(t, 0) > 0]
     frequent = sorted((x for x in items if x[1] > rare_df), key=lambda x: (-x[1], x[0]))
     rare = sorted((x for x in items if x[1] <= rare_df), key=lambda x: (-x[1], x[0]))
     if rng is not None:
@@ -137,9 +170,9 @@ def build_vocab(
     chosen.sort(key=lambda x: (-x[1], x[0]))
     tokens = [t for t, _ in chosen]
     counts = np.asarray([c for _, c in chosen], dtype=np.int64)
-    log.info("bow vocab: %d tokens (%d frequent, %d rare df≤%d) из %d кандидатов с df≥%d", len(tokens), n_freq, n_rare,
-             rare_df, len(items), min_df)
-    return Vocab(tokens=tokens, df=counts, rare_df=rare_df)
+    log.info("bow vocab: %d tokens (%d frequent, %d rare df≤%d) из %d кандидатов с df≥%d (df по корпусу из %s функций)", len(tokens),
+             n_freq, n_rare, rare_df, len(items), min_df, n_docs)
+    return Vocab(tokens=tokens, df=counts, rare_df=rare_df, min_df=min_df, n_docs=n_docs)
 
 
 def targets(bags: Sequence[set[str]], vocab: Vocab) -> sparse.csr_matrix:
@@ -199,11 +232,15 @@ def best_threshold(scores_fn: Any, Y: sparse.csr_matrix, lo_hi: tuple[float, flo
     return float(grid[k]), float(f1[k])
 
 
-def per_token_thresholds(scores_cols: Any, Y: sparse.csr_matrix, block: int = COL_BLOCK) -> np.ndarray:
-    """Порог на каждый токен, максимизирующий его F1 (правило score > t) по скорам обучающих строк.
+def per_token_thresholds(scores_cols: Any, Y: sparse.csr_matrix, block: int = COL_BLOCK, min_precision: float = DEFAULT_MIN_PRECISION,
+                         min_f1: float = DEFAULT_MIN_F1) -> np.ndarray:
+    """Порог на каждый токен, максимизирующий его F1 (правило score > t) по вневыборочным скорам обучающих строк.
 
-    scores_cols(lo, hi) → (N, hi−lo) скоры столбцов lo..hi. Токены без положительных примеров (или с F1 = 0) → +inf.
-    F1 при отсечении top-k = 2·tp_k / (k + n_pos), поэтому достаточно отсортировать скоры по убыванию.
+    scores_cols(lo, hi) → (N, hi−lo) скоры столбцов lo..hi. F1 при отсечении top-k = 2·tp_k / (k + n_pos), поэтому
+    достаточно отсортировать скоры по убыванию. Допустимы только отсечения с precision = tp_k/k ≥ min_precision и
+    F1 ≥ min_f1: без этого токен с 2–3 положительными примерами среди N строк при чисто случайных скорах получает
+    F1 = 2/(r+2) > 0 (r — ранг первого положительного, ~N/3) и «стреляет» на трети функций. Токены без допустимого
+    отсечения (в т. ч. без положительных примеров) → +inf (никогда не предсказываются).
     """
     n, v = Y.shape
     thr = np.full(v, np.inf, dtype=np.float32)
@@ -218,6 +255,7 @@ def per_token_thresholds(scores_cols: Any, Y: sparse.csr_matrix, block: int = CO
         Ss = np.take_along_axis(S, order, axis=0)
         tp = np.cumsum(np.take_along_axis(Yb, order, axis=0), axis=0, dtype=np.float32)
         f1 = 2.0 * tp / (k + np.maximum(npos, 1.0)[None, :])
+        f1 = np.where((tp / k >= float(min_precision)) & (f1 >= float(min_f1)), f1, -1.0)  # недопустимые отсечения
         best = np.argmax(f1, axis=0)
         cols = np.arange(hi - lo)
         s_best = Ss[best, cols]
@@ -231,17 +269,21 @@ def per_token_thresholds(scores_cols: Any, Y: sparse.csr_matrix, block: int = CO
 def bow_metrics(pred_fn: Any, Y: sparse.csr_matrix, vocab: Vocab, chunk: int = CHUNK) -> dict[str, Any]:
     """Метрики инверсии: micro P/R/F1 по (функция, токен), recall/precision/F1 по редким токенам (df ≤ rare_df),
     доля функций с полностью восстановленным набором, средний Жаккар. pred_fn(lo, hi) → bool (hi−lo, V)."""
-    n = Y.shape[0]
+    n, v = Y.shape
     rare = vocab.rare_mask
     tp = fp = fn = 0.0
     tp_r = fp_r = fn_r = 0.0
     exact = 0
     jacc = 0.0
+    pred_col = np.zeros(v, dtype=np.float64)  # число срабатываний по токенам (эталон случайности)
+    true_col = np.zeros(v, dtype=np.float64)
     for lo in range(0, n, chunk):
         hi = min(n, lo + chunk)
         p = pred_fn(lo, hi)
         y = _dense_rows(Y, lo, hi)
         inter = p & y
+        pred_col += p.sum(axis=0)
+        true_col += y.sum(axis=0)
         tp += float(inter.sum())
         fp += float((p & ~y).sum())
         fn += float((~p & y).sum())
@@ -255,10 +297,19 @@ def bow_metrics(pred_fn: Any, Y: sparse.csr_matrix, vocab: Vocab, chunk: int = C
             jacc += float(np.where(union > 0, inter_n / np.maximum(union, 1), 1.0).sum())
     out = f1_from_counts(tp, tp + fp, tp + fn)
     rare_m = f1_from_counts(tp_r, tp_r + fp_r, tp_r + fn_r)
+    n_rare = int(rare.sum())
+    rare_pred, rare_true = pred_col[rare], true_col[rare]
+    # recall случайного предсказателя с теми же частотами срабатываний по токенам: Σ_t fire_t·n_true_t / Σ_t n_true_t
+    chance = float((rare_pred / n * rare_true).sum() / rare_true.sum()) if (n and rare_true.sum() > 0) else None
     out.update({
         "rare_id_recall": rare_m["recall"] if (tp_r + fn_r) > 0 else None,
         "rare_id_precision": rare_m["precision"] if (tp_r + fp_r) > 0 else None,
         "rare_id_f1": rare_m["f1"] if (tp_r + fn_r) > 0 else None,
+        "rare_id_recall_chance": chance,
+        "rare_fire_rate": float(rare_pred.sum() / (n * n_rare)) if (n and n_rare) else None,
+        "rare_pred_per_fn": float(rare_pred.sum() / n) if n else None,
+        "n_rare_fired": int((rare_pred > 0).sum()),
+        "n_rare_vocab": n_rare,
         "n_rare_true": int(tp_r + fn_r),
         "exact_set_rate": exact / n if n else 0.0,
         "mean_jaccard": jacc / n if n else 0.0,
@@ -321,7 +372,7 @@ class _RidgeHead:
         """Диагональ hat-матрицы h_ii = 1/n + x̃ᵢᵀ(X̃ᵀX̃ + λI)⁻¹x̃ᵢ для обучающих строк (точный leave-one-out)."""
         assert self.mu is not None and self.G_inv is not None
         Xc = np.asarray(X, dtype=np.float64) - self.mu
-        h = 1.0 / self.n + np.einsum("ij,jk,ik->i", Xc, self.G_inv, Xc)
+        h = 1.0 / self.n + np.sum((Xc @ self.G_inv) * Xc, axis=1)  # одно BLAS-умножение вместо скалярного einsum
         return np.clip(h, 0.0, 0.99).astype(np.float32)
 
     def loo_scores_cols(self, X: np.ndarray, Y: sparse.csc_matrix, h: np.ndarray, lo: int, hi: int) -> np.ndarray:
@@ -413,13 +464,15 @@ class BowInverter:
 
     def __init__(self, vocab: Vocab, backend: str = "auto", ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
                  mlp_hidden: int = 1024, mlp_epochs: int = 10, mlp_lr: float = 1e-3, mlp_batch: int = 256,
-                 device: str | None = None, seed: int = 0, decision: str = "auto", thr_mem: float = DEFAULT_THR_MEM) -> None:
+                 device: str | None = None, seed: int = 0, decision: str = "auto", thr_mem: float = DEFAULT_THR_MEM,
+                 min_precision: float = DEFAULT_MIN_PRECISION, min_f1: float = DEFAULT_MIN_F1) -> None:
         self.vocab = vocab
         if decision not in DECISIONS:
             raise ValueError(f"unknown decision rule {decision!r}; known: {DECISIONS}")
         self.decision = decision
         self.val_f1_rules: dict[str, float] = {}
         self.thr_mem = float(thr_mem)
+        self.min_precision, self.min_f1 = float(min_precision), float(min_f1)
         self.thresholds: np.ndarray | None = None
         self._tr_idx: np.ndarray = np.zeros(0, dtype=np.int64)
         if backend == "auto":
@@ -450,7 +503,7 @@ class BowInverter:
         sv = self.scores(Xv[: min(len(val_idx), 512)])
         lo_hi = (float(np.percentile(sv, 50)), float(np.percentile(sv, 99.9))) if sv.size else (0.0, 1.0)
         self.threshold, self.val_f1 = best_threshold(lambda lo, hi: self.scores(Xv[lo:hi]), Yv, lo_hi)
-        self.thresholds = self._fit_thresholds(X, Y, rng)
+        self.thresholds = self._fit_thresholds(X[tr_idx], Y[tr_idx], rng)  # только обучающие строки: валидация честная
         n_fire = int(np.isfinite(self.thresholds).sum())
         self.val_f1_rules = {rule: bow_metrics(lambda lo, hi, r=rule: self.predict(Xv[lo:hi], decision=r), Yv, self.vocab)["f1"]
                              for rule in ("global", "per_token")}
@@ -462,15 +515,15 @@ class BowInverter:
         return self
 
     def _fit_thresholds(self, X: np.ndarray, Y: sparse.csr_matrix, rng: random.Random | None) -> np.ndarray:
-        """Пороги на токен по вневыборочным скорам всех обучающих строк: ridge — точный leave-one-out через рычаги
-        (по столбцам, без материализации); MLP — 2-кратный cross-fitting (две дополнительные модели на половинах),
-        матрица скоров float16 (при превышении бюджета памяти — случайная подвыборка строк)."""
+        """Пороги на токен по вневыборочным скорам обучающих строк (X, Y — только они): ridge — точный leave-one-out
+        через рычаги (по столбцам, без материализации); MLP — 2-кратный cross-fitting (две дополнительные модели на
+        половинах), матрица скоров float16 (при превышении бюджета памяти — случайная подвыборка строк)."""
         n, v = Y.shape
+        kw = {"min_precision": self.min_precision, "min_f1": self.min_f1}
         if self.backend == "ridge":
-            h = np.zeros(n, dtype=np.float32)  # строки валидации уже вне выборки: h = 0 → обычные скоры
-            h[self._tr_idx] = self.head.leverage(X[self._tr_idx])
+            h = self.head.leverage(X)
             Yc = Y.tocsc()
-            return per_token_thresholds(lambda lo, hi: self.head.loo_scores_cols(X, Yc, h, lo, hi), Y)
+            return per_token_thresholds(lambda lo, hi: self.head.loo_scores_cols(X, Yc, h, lo, hi), Y, **kw)
         g = as_generator(rng or 0)
         rows = np.arange(n)
         max_rows = int(self.thr_mem // max(1, 2 * v))
@@ -490,7 +543,7 @@ class BowInverter:
                 idx = sel[lo : lo + 4096]
                 S16[[pos[int(r)] for r in idx]] = head_k.scores(X[idx]).astype(np.float16)
             log.info("A1 mlp cross-fit fold %d/2 done (%d rows scored)", k + 1, sel.size)
-        return per_token_thresholds(lambda lo, hi: S16[:, lo:hi].astype(np.float32), Y[rows])
+        return per_token_thresholds(lambda lo, hi: S16[:, lo:hi].astype(np.float32), Y[rows], **kw)
 
     def scores(self, X: np.ndarray) -> np.ndarray:
         """Скоры (M, V) float32 (ridge — линейные, torch — сигмоида)."""
@@ -516,8 +569,11 @@ class BowInverter:
             "precision_global": rules["global"]["precision"], "recall_global": rules["global"]["recall"],
             "precision_per_token": pt["precision"], "recall_per_token": pt["recall"],
             "rare_id_recall": pt["rare_id_recall"], "rare_id_precision": pt["rare_id_precision"], "rare_id_f1": pt["rare_id_f1"],
+            "rare_id_recall_chance": pt["rare_id_recall_chance"], "rare_fire_rate": pt["rare_fire_rate"],
+            "rare_pred_per_fn": pt["rare_pred_per_fn"], "n_rare_fired": pt["n_rare_fired"], "n_rare_vocab": pt["n_rare_vocab"],
             "rare_id_rule": "per_token", f"rare_id_recall_{chosen}": rules[chosen]["rare_id_recall"],
             "decision": chosen, "threshold": float(self.threshold), "backend": self.backend,
+            "thr_min_precision": self.min_precision, "thr_min_f1": self.min_f1,
         })
         return m
 
@@ -535,21 +591,24 @@ def a1_params(cfg: dict[str, Any]) -> dict[str, Any]:
         "mlp_hidden": int(p.get("a1_hidden", 1024)), "mlp_epochs": int(p.get("a1_epochs", 10)), "mlp_lr": float(p.get("a1_lr", 1e-3)),
         "mlp_batch": int(p.get("a1_batch", 256)), "decision": str(p.get("a1_decision", "auto")),
         "thr_mem": float(p.get("a1_thr_mem", DEFAULT_THR_MEM)),
+        "min_precision": float(p.get("a1_min_precision", DEFAULT_MIN_PRECISION)), "min_f1": float(p.get("a1_min_f1", DEFAULT_MIN_F1)),
     }
 
 
 def train_bow_attack(train_emb: np.ndarray, train_bags: Sequence[set[str]], cfg: dict[str, Any], rng: random.Random | None = None,
-                     backend: str | None = None, vocab: Vocab | None = None) -> tuple[BowInverter, Vocab, sparse.csr_matrix]:
-    """Строит словарь (если не задан), цели и обучает BowInverter на plain-эмбеддингах public_train.
-    Возвращает (модель, словарь, Y_train)."""
+                     backend: str | None = None, vocab: Vocab | None = None, df: dict[str, int] | None = None,
+                     n_docs: int | None = None) -> tuple[BowInverter, Vocab, sparse.csr_matrix]:
+    """Строит словарь (если не задан; df/n_docs — частоты по полному корпусу public_train, см. build_vocab), цели и
+    обучает BowInverter на plain-эмбеддингах public_train. Возвращает (модель, словарь, Y_train)."""
     p = a1_params(cfg)
     rng = rng or random.Random(int(cfg.get("seed", 0)))
     if vocab is None:
-        vocab = build_vocab(train_bags, p["vocab"], p["min_df"], p["rare_df"], p["rare_fraction"], rng=random.Random(rng.random()))
+        vocab = build_vocab(train_bags, p["vocab"], p["min_df"], p["rare_df"], p["rare_fraction"], rng=random.Random(rng.random()),
+                            df=df, n_docs=n_docs)
     Y = targets(train_bags, vocab)
     model = BowInverter(vocab, backend or p["backend"], ridge_alpha=p["ridge_alpha"], mlp_hidden=p["mlp_hidden"],
                         mlp_epochs=p["mlp_epochs"], mlp_lr=p["mlp_lr"], mlp_batch=p["mlp_batch"], seed=int(cfg.get("seed", 0)),
-                        decision=p["decision"], thr_mem=p["thr_mem"])
+                        decision=p["decision"], thr_mem=p["thr_mem"], min_precision=p["min_precision"], min_f1=p["min_f1"])
     model.fit(np.asarray(train_emb, dtype=np.float32), Y, rng=random.Random(rng.random()))
     return model, vocab, Y
 

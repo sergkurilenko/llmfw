@@ -5,6 +5,8 @@
 (по умолчанию) или МНК (np.linalg.lstsq). Затем инвертирует защищённые векторы индекса
 (E ≈ E' Q̂ для ортогональной Q̂, иначе через псевдообратную) и применяет обученную модель A1.
 Кривая утечки — по n ∈ cfg.privacy.attack_leaked_pairs; n = 0 ⇒ Q̂ = I (прямое применение A1).
+Выборки утёкших пар вложены по n: одна перестановка пула на кривую (leak_permutation), точка n берёт её первые n
+элементов, так что точки кривой отличаются только числом пар, а не шумом выборки.
 """
 
 from __future__ import annotations
@@ -75,15 +77,28 @@ def mean_cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean(np.sum(a * b, axis=1) / (na * nb))) if a.shape[0] else 0.0
 
 
-def sample_leaked_pairs(pool_plain: np.ndarray, pool_defended: np.ndarray, n: int, rng: Any) -> tuple[np.ndarray, np.ndarray]:
-    """n случайных пар из пула (без возвращения; n обрезается до размера пула)."""
+def leak_permutation(m: int, rng: Any) -> np.ndarray:
+    """Перестановка индексов пула (m,), задающая вложенные выборки утёкших пар: первые n элементов — выборка для n."""
+    return as_generator(rng).permutation(int(m))
+
+
+def sample_leaked_pairs(pool_plain: np.ndarray, pool_defended: np.ndarray, n: int, rng: Any = None,
+                        perm: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """n пар из пула без возвращения (n обрезается до размера пула): первые n элементов перестановки perm
+    (вложенные выборки) либо, если perm=None, случайная выборка по rng."""
     m = pool_plain.shape[0]
     if pool_defended.shape[0] != m:
         raise ValueError("pool_plain and pool_defended must have the same number of rows")
     k = int(min(max(0, n), m))
     if k == 0:
         return pool_plain[:0], pool_defended[:0]
-    idx = np.sort(as_generator(rng).choice(m, size=k, replace=False))
+    if perm is not None:
+        perm = np.asarray(perm, dtype=np.int64)
+        if perm.shape != (m,):
+            raise ValueError(f"perm must be a permutation of {m} pool rows, got shape {perm.shape}")
+        idx = np.sort(perm[:k])
+    else:
+        idx = np.sort(as_generator(rng).choice(m, size=k, replace=False))
     return pool_plain[idx], pool_defended[idx]
 
 
@@ -94,14 +109,15 @@ def align_once(
     target_defended: np.ndarray,
     target_Y: sparse.csr_matrix,
     n: int,
-    rng: Any,
+    rng: Any = None,
     method: str = "procrustes",
     Q_true: np.ndarray | None = None,
     target_plain: np.ndarray | None = None,
+    perm: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Одна точка кривой: n утёкших пар → Q̂ → инверсия target_defended → метрики A1.
-    Дополнительно: q_rel_error (если известна Q_true) и recovered_cos (если известны plain-цели)."""
-    p, dfd = sample_leaked_pairs(pool_plain, pool_defended, n, rng)
+    """Одна точка кривой: n утёкших пар (первые n из perm либо случайные по rng) → Q̂ → инверсия target_defended →
+    метрики A1. Дополнительно: q_rel_error (если известна Q_true) и recovered_cos (если известны plain-цели)."""
+    p, dfd = sample_leaked_pairs(pool_plain, pool_defended, n, rng, perm=perm)
     Q_hat = estimate_projection(p, dfd, method=method) if p.shape[0] else np.eye(target_defended.shape[1], dtype=np.float32)
     rec = recover(target_defended, Q_hat)
     out = model.evaluate(rec, target_Y)
@@ -124,14 +140,15 @@ def run_attack_align(
     method: str = "procrustes",
     Q_true: np.ndarray | None = None,
     target_plain: np.ndarray | None = None,
+    perm: np.ndarray | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Кривая утечки {str(n): метрики} по n ∈ leaked_pairs (одна и та же выборка пар — вложенная по n)."""
-    g = as_generator(rng)
-    seeds = {int(n): int(g.integers(0, 2**63 - 1)) for n in leaked_pairs}
+    """Кривая утечки {str(n): метрики} по n ∈ leaked_pairs. Выборки пар вложены по n: одна перестановка пула
+    (perm, по умолчанию leak_permutation(m, rng)), точка n использует её первые n элементов."""
+    perm = leak_permutation(pool_plain.shape[0], rng) if perm is None else np.asarray(perm, dtype=np.int64)
     out: dict[str, dict[str, Any]] = {}
     for n in leaked_pairs:
-        res = align_once(model, pool_plain, pool_defended, target_defended, target_Y, int(n), np.random.default_rng(seeds[int(n)]),
-                         method=method, Q_true=Q_true, target_plain=target_plain)
+        res = align_once(model, pool_plain, pool_defended, target_defended, target_Y, int(n), method=method, Q_true=Q_true,
+                         target_plain=target_plain, perm=perm)
         log.info("A2 n=%d (eff %d): f1=%.3f rare_recall=%s q_err=%s", n, res["n_effective"], res["f1"], res.get("rare_id_recall"),
                  None if "q_rel_error" not in res else round(res["q_rel_error"], 4))
         out[str(int(n))] = res

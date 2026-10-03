@@ -1,14 +1,19 @@
 """Построение наборов запросов (DESIGN.md §5): к каждой отобранной функции применяется каждое
 программное преобразование и partial для каждого L; результат — data/queries/{set}.jsonl.
 
-Наборы: protected (label=1), hard_neg, public_calib, public_test (label=0) и protected_windows
-(файловые окна protected, label=1, преобразования identity + partial).
+Наборы: protected (label=1), hard_neg, public_calib, public_test (label=0) и наборы окон <split>_windows
+(файловые окна из data/functions/<split>_windows.jsonl, cfg.windows.splits; protected_windows — label=1,
+public_calib_windows / public_test_windows — негативы формы окна, label=0; преобразования identity + partial).
+insert_deadcode в наборах оценки использует набор шаблонов cfg.transforms.deadcode_templates (по умолчанию eval —
+не тот, что при обучении энкодера/комбинатора, evasion.TEMPLATE_SETS).
+Файлы пишутся атомарно (tmp + os.replace); пустой файл считается отсутствующим.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -24,10 +29,32 @@ log = logging.getLogger(__name__)
 
 QUERY_SETS: tuple[str, ...] = ("protected", "hard_neg", "public_calib", "public_test")
 WINDOW_SET = "protected_windows"
+WINDOW_SUFFIX = "_windows"
 ALL_SETS: tuple[str, ...] = QUERY_SETS + (WINDOW_SET,)
 WINDOW_TRANSFORMS: tuple[str, ...] = ("identity",)
+WINDOWS_FILE = "protected_windows.jsonl"  # = smcode.data.extract.WINDOWS_FILE (окна protected, kind == window)
 DEFAULT_MAX_PER_SPLIT = 5000
+DEFAULT_DEADCODE_TEMPLATES = "eval"
 _DROP_PARAMS = ("mapping",)  # объёмные параметры, не нужные в файле запросов
+
+
+def is_window_set(set_name: str) -> bool:
+    """Набор окон (<split>_windows)."""
+    return set_name.endswith(WINDOW_SUFFIX)
+
+
+def window_sets(cfg: dict[str, Any]) -> list[str]:
+    """Наборы окон по cfg.windows.splits: protected_windows (члены) и <split>_windows негативов (public_calib, public_test, ...)."""
+    raw = (cfg.get("windows") or {}).get("splits") or ["protected"]
+    return [f"{s}{WINDOW_SUFFIX}" for s in raw]
+
+
+def all_sets(cfg: dict[str, Any]) -> list[str]:
+    """Все наборы запросов конфига: QUERY_SETS + наборы окон (protected_windows всегда первый среди окон)."""
+    wins = window_sets(cfg)
+    if WINDOW_SET not in wins:
+        wins = [WINDOW_SET, *wins]
+    return [*QUERY_SETS, *wins]
 
 
 def label_for_set(set_name: str) -> int:
@@ -36,8 +63,40 @@ def label_for_set(set_name: str) -> int:
 
 
 def source_split(set_name: str) -> str:
-    """Файл функций для набора запросов (protected_windows берётся из protected.jsonl)."""
-    return "protected" if set_name == WINDOW_SET else set_name
+    """Сплит функций для набора запросов (окна <split>_windows — сплит <split>; см. functions_path)."""
+    return set_name[: -len(WINDOW_SUFFIX)] if is_window_set(set_name) else set_name
+
+
+def functions_path(cfg: dict[str, Any], set_name: str) -> Path:
+    """Файл функций-источников: data/functions/<split>.jsonl; для наборов окон — <split>_windows.jsonl
+    (как пишет модуль данных), с откатом на <split>.jsonl (строки kind == window), если его нет."""
+    fdir = resolve_path(cfg, "functions")
+    if is_window_set(set_name):
+        win = fdir / f"{set_name}.jsonl"
+        if _is_complete(win):
+            return win
+    return fdir / f"{source_split(set_name)}.jsonl"
+
+
+def _is_complete(path: Path) -> bool:
+    """Файл существует и непуст (прерванная запись оставляет пустой/отсутствующий файл)."""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:  # pragma: no cover
+        return False
+
+
+def write_jsonl_atomic(path: str | Path, rows: Iterable[Any]) -> int:
+    """JSONL через временный файл + os.replace: прерванный запуск не оставляет усечённого файла."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        n = write_jsonl(tmp, rows)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    return n
 
 
 def length_bin(n_tokens: int, bins: Sequence[Sequence[int]]) -> int:
@@ -84,21 +143,33 @@ def _make_query(rec: FunctionRecord, set_name: str, res: TransformResult, idx: i
     )
 
 
+def deadcode_template_set(cfg: dict[str, Any]) -> str:
+    """Набор шаблонов insert_deadcode для наборов запросов (cfg.transforms.deadcode_templates: eval | train)."""
+    return str((cfg.get("transforms", {}) or {}).get("deadcode_templates") or DEFAULT_DEADCODE_TEMPLATES)
+
+
 def queries_for_record(rec: FunctionRecord, set_name: str, cfg: dict[str, Any],
                        transforms: Iterable[str] | None = None,
                        partial_lines: Iterable[int] | None = None,
-                       stats: dict[str, Counter] | None = None) -> list[QueryRecord]:
+                       stats: dict[str, Counter] | None = None,
+                       template_set: str | None = None,
+                       rename_styles: Iterable[str] | None = None) -> list[QueryRecord]:
     """Все запросы для одной функции: каждое программное преобразование + partial для каждого L.
-    ГПСЧ детерминирован по (seed, set, id, transform)."""
+    ГПСЧ детерминирован по (seed, set, id, transform). template_set — шаблоны insert_deadcode
+    (по умолчанию cfg.transforms.deadcode_templates); rename_styles — ограничение стилей rename_ids (обучение)."""
     tcfg = cfg.get("transforms", {})
     names = list(tcfg.get("programmatic", ["identity"]) if transforms is None else transforms)
     Ls = list(tcfg.get("partial_lines", []) if partial_lines is None else partial_lines)
     every = int(tcfg.get("deadcode_every", 3))
+    tset = template_set or deadcode_template_set(cfg)
+    styles = [str(s) for s in rename_styles] if rename_styles else None
     out: list[QueryRecord] = []
     lang = canon_lang(rec.lang)
     for name in names:
         rng = get_rng(cfg, f"queries:{set_name}:{rec.id}:{name}")
-        params = {"every": every} if name == "insert_deadcode" else {}
+        params: dict[str, Any] = {"every": every, "template_set": tset} if name == "insert_deadcode" else {}
+        if name == "rename_ids" and styles:
+            params["style"] = rng.choice(styles)
         res = apply_transform(name, rec.code, lang, rng, **params)
         if stats is not None:
             stats[name]["ok" if res.ok else "failed"] += 1
@@ -109,17 +180,20 @@ def queries_for_record(rec: FunctionRecord, set_name: str, cfg: dict[str, Any],
         res = apply_transform("partial", rec.code, lang, rng, L=int(L))
         if stats is not None:
             stats[f"partial@{L}"]["ok" if res.ok else "failed"] += 1
+            if res.ok and res.params.get("parses") is False:
+                stats[f"partial@{L}"]["unparsed"] += 1  # окно принято, но не разбирается (IDE-фрагмент)
         if res.ok:
             out.append(_make_query(rec, set_name, res, i))
     return out
 
 
 def _load_records(cfg: dict[str, Any], set_name: str) -> list[FunctionRecord]:
-    path = resolve_path(cfg, "functions") / f"{source_split(set_name)}.jsonl"
-    if not path.exists():
+    """Функции-источники набора (kind == window для наборов окон, иначе function), только языки из cfg."""
+    path = functions_path(cfg, set_name)
+    if not _is_complete(path):
         log.warning("functions file not found for set %s: %s", set_name, path)
         return []
-    want_kind = "window" if set_name == WINDOW_SET else "function"
+    want_kind = "window" if is_window_set(set_name) else "function"
     recs = [r for r in read_functions(path) if (r.kind or "function") == want_kind]
     langs = set(cfg.get("languages", []))
     if langs:
@@ -132,7 +206,7 @@ def build_set(cfg: dict[str, Any], set_name: str, max_per_split: int | None = No
     """Строит один набор запросов; возвращает число записанных строк (−1, если пропущен как готовый)."""
     out_dir = resolve_path(cfg, "queries")
     out_path = out_dir / f"{set_name}.jsonl"
-    if out_path.exists() and not force:
+    if _is_complete(out_path) and not force:
         log.info("skip %s: exists (%s)", set_name, out_path)
         return -1
     recs = _load_records(cfg, set_name)
@@ -144,7 +218,7 @@ def build_set(cfg: dict[str, Any], set_name: str, max_per_split: int | None = No
     bins = cfg.get("eval", {}).get("length_bins_tokens", [[0, 10 ** 9]])
     sampled = sample_records(recs, max_n, get_rng(cfg, f"sample:{set_name}"), bins)
     log.info("set %s: %d records, sampled %d", set_name, len(recs), len(sampled))
-    transforms = WINDOW_TRANSFORMS if set_name == WINDOW_SET else None
+    transforms = WINDOW_TRANSFORMS if is_window_set(set_name) else None
     stats: dict[str, Counter] = defaultdict(Counter)
     per_lang: Counter = Counter()
 
@@ -159,7 +233,7 @@ def build_set(cfg: dict[str, Any], set_name: str, max_per_split: int | None = No
                 per_lang[q.lang] += 1
                 yield q
 
-    n = write_jsonl(out_path, gen())
+    n = write_jsonl_atomic(out_path, gen())
     summary = {
         "set": set_name, "n_source": len(recs), "n_sampled": len(sampled), "n_queries": n,
         "label": label_for_set(set_name), "per_transform": {k: dict(v) for k, v in sorted(stats.items())},
@@ -173,9 +247,9 @@ def build_set(cfg: dict[str, Any], set_name: str, max_per_split: int | None = No
 
 def build_queries(cfg: dict[str, Any], splits: Iterable[str] | None = None, force: bool = False,
                   max_per_split: int | None = None) -> dict[str, int]:
-    """Строит наборы запросов для указанных наборов (по умолчанию все из ALL_SETS).
+    """Строит наборы запросов для указанных наборов (по умолчанию все из all_sets(cfg): QUERY_SETS + окна).
     Возвращает {set: число строк}; −1 — набор уже существовал и был пропущен."""
-    sets = list(splits) if splits else list(ALL_SETS)
+    sets = list(splits) if splits else all_sets(cfg)
     result: dict[str, int] = {}
     for s in sets:
         result[s] = build_set(cfg, s, max_per_split=max_per_split, force=force)

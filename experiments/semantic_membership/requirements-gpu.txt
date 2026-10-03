@@ -1,7 +1,6 @@
+# GPU-часть стенда (M3/M4, дообучение, эмбеддинги, приватность с MLP/A3). Не включает vllm (см. requirements-llm.txt):
+# колёса vllm жёстко фиксируют версию torch, и установка его в тот же venv диктует torch всему стенду.
 -r requirements.txt
 torch>=2.3
 transformers>=4.44
-sentence-transformers>=3.0
-faiss-cpu>=1.8          # или faiss-gpu
-accelerate>=0.33
-vllm>=0.6               # для LLM-преобразований (paraphrase/translate); опционально
+faiss-cpu>=1.8          # или faiss-gpu; необязателен (ann.py откатывается к numpy)

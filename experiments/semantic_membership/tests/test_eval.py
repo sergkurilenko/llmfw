@@ -16,9 +16,9 @@ from smcode import calibration as cal
 from smcode.config import DEFAULT_CONFIG, load_config
 from smcode.eval import metrics as M
 from smcode.eval import run_eval as RE
-from smcode.eval.plots import FIGURE_FILES, write_figures
-from smcode.eval.report import format_summary, run_report
-from smcode.eval.tables import TABLE_FILES, fmt, fmt_ci, write_tables
+from smcode.eval.plots import FIGURE_FILES, fig_F7, latency_point, privacy_points, write_figures
+from smcode.eval.report import format_summary, run_report, summary_is_stale
+from smcode.eval.tables import TABLE_FILES, fmt, fmt_ci, fmt_ci_cluster, table_T4, variant_description, write_tables
 from smcode.types import QueryResult, read_jsonl, write_jsonl
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -248,6 +248,13 @@ def test_metrics_summary_end_to_end(stand: dict[str, Any]):
         assert set(m["fpr"]["0.05"]["conformal"]) == {"public_calib", "public_test", "hard_neg"}
         assert set(m["fpr"]["0.05"]["domain"]) == {"public_test", "hard_neg_test"}
         assert m["fpr"]["0.05"]["conformal"]["public_test"]["max_subgroup"]["group"].split(":")[0] in ("lang", "transform")
+        pt = m["fpr"]["0.05"]["conformal"]["public_test"]
+        assert pt["ci_cluster"] is not None and pt["ci_cluster"][0] <= pt["value"] <= pt["ci_cluster"][1]
+        assert "ci_cluster" in pt["max_subgroup"] and all(v["ci_cluster"] is not None for v in pt["by_lang"].values())
+        assert "conformal_single" in m["tpr"]["0.05"] and m["thresholds"]["0.05"]["n_calib_single"] == 80
+        assert m["thresholds"]["0.05"]["tie_mass_at_tau"] == pytest.approx(1 / (80 * 7))  # непрерывные скоры: связь только сам τ
+        assert set(m["fpr"]["0.05"]["conformal_single"]) == {"public_calib", "public_test", "hard_neg"}
+        assert m["latency_ms"]["end_to_end"]["p95"] == m["latency_ms"]["p95"] and m["incomplete"] is None
         assert set(m["confusion"]["0.05"]["conformal"]) == {"protected", "public_calib", "public_test", "hard_neg"}
         c = m["confusion"]["0.05"]["conformal"]
         assert c["protected"]["tp"] + c["protected"]["fn"] == blk["n"] and c["public_test"]["fp"] == m["fpr"]["0.05"]["conformal"]["public_test"]["k"]
@@ -308,6 +315,9 @@ def test_tables_written(stand: dict[str, Any]):
     assert "Все классы, α = 1 %" in t2 and "Все классы, α = 5 %" in t2
     t3 = paths["T3"].read_text(encoding="utf-8")
     assert "FPR hard_neg [ДИ]" in t3 and "5 %" in t3 and "1 %" in t3 and "Доменная калибровка" in t3
+    assert "кластерный ДИ" in t3 and "1 запрос/функция" in t3 and "Обменяемые единицы" in t3
+    t5 = paths["T5"].read_text(encoding="utf-8")
+    assert "Сквозная латентность" in t5
     t1 = paths["T1"].read_text(encoding="utf-8")
     assert "protected (P)" in t1 and "| 90 |" in t1 and "300" in t1
     t5 = paths["T5"].read_text(encoding="utf-8")
@@ -416,20 +426,32 @@ def test_run_eval_query_batch_path(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert RE.read_scores_meta(cfg, "exact", "public_test")["latency_mode"] == "per_query"
     assert RE.eval_method(cfg, "exact", sets=["public_test"]) == {"public_test": {"skipped": True}}  # идемпотентность
     assert RE.eval_method(cfg, "exact", sets=["public_test"], force=True, limit=3)["public_test"]["n_scored"] == 3
+    # --limit пишет отдельный файл и не трогает полный
+    assert len(list(read_jsonl(RE.scores_path(cfg, "exact", "public_test")))) == len(rows)
+    assert len(list(read_jsonl(RE.scores_path(cfg, "exact", "public_test", limit=3)))) == 3
+    assert RE.scores_path(cfg, "exact", "public_test", limit=3).name == "public_test.limit3.jsonl"
+    assert RE.read_scores_meta(cfg, "exact", "public_test", limit=3)["limit"] == 3 and RE.read_scores_meta(cfg, "exact", "public_test")["limit"] is None
+    assert RE.eval_method(cfg, "exact", sets=["public_test"], limit=3) == {"public_test": {"skipped": True}}
     assert RE.available_methods(cfg) == ["exact"] and RE.available_sets(cfg) == ["public_test"]
 
 
 def test_run_eval_numpy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg, rows = _prepare_eval(tmp_path, monkeypatch, {"semantic": DummySemantic, "hybrid": DummyHybrid})
-    emb = np.random.default_rng(0).random((len(rows) - 1, 8)).astype(np.float16)  # один запрос без эмбеддинга
-    qids = np.asarray([r["qid"] for r in rows[:-1]])
+    emb = np.random.default_rng(0).random((len(rows), 8)).astype(np.float16)
     p = RE.query_embeddings_path(cfg, "public_test")
     p.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(p, qids=qids, emb=emb)
+    # один запрос без эмбеддинга (запросы добавлены после 06): полный прогон — ошибка с указанием на 06, а не тихий пропуск
+    np.savez(p, qids=np.asarray([r["qid"] for r in rows[:-1]]), emb=emb[:-1])
+    with pytest.raises(ValueError, match="06_embed"):
+        RE.run_eval(cfg, methods=["semantic"], sets=["public_test"], batch=4)
+    assert not RE.scores_path(cfg, "semantic", "public_test").exists()
+    sc, meta = RE.score_set(DummySemantic(cfg), rows, emb=([r["qid"] for r in rows[:-1]], emb[:-1].astype(np.float32)), cfg=cfg, batch=4)
+    assert meta["n_missing_embeddings"] == 1 and len(sc) == len(rows) - 1  # score_set сам лишь считает пропуски
+    np.savez(p, qids=np.asarray([r["qid"] for r in rows]), emb=emb)
     res = RE.run_eval(cfg, methods=["semantic", "hybrid"], sets=["public_test"], batch=4, bench=2)
     for m, k in (("semantic", 1.0), ("hybrid", 0.5)):
         meta = res[m]["public_test"]
-        assert meta["latency_mode"] == "batch_amortized(batch=4)" and meta["n_scored"] == len(rows) - 1 and meta["n_missing_embeddings"] == 1
+        assert meta["latency_mode"] == "batch_amortized(batch=4)" and meta["n_scored"] == len(rows) and meta["n_missing_embeddings"] == 0
         assert meta["latency_benchmark"]["mode"] == "numpy_batch1"
         out = list(read_jsonl(RE.scores_path(cfg, m, "public_test")))
         assert [r["score"] for r in out] == pytest.approx([float(v) * k for v in emb[:, 0].astype(np.float32)], abs=1e-6)
@@ -465,9 +487,12 @@ def test_report_and_scripts(stand: dict[str, Any], monkeypatch: pytest.MonkeyPat
     assert "T2" in res["tables"] and "F1" in res["figures"] and "F5" not in res["figures"]  # без hybrid — F5 пропущен
     text = format_summary(res["summary"], res["tables"], res["figures"])
     assert "M3 semantic" in text and "TPR" in text and "Таблицы" in text
-    # повторный запуск без force переиспользует summary.json
+    # повторный запуск без force: набор каталогов скоров (4) ≠ summary.methods (2) → пересчёт
     res2 = run_report(cfg, force=False, figures=False)
-    assert res2["summary"]["generated_at"] == res["summary"]["generated_at"]
+    assert res2["recomputed"] and set(res2["summary"]["methods"]) == set(METHOD_DISTS)
+    # третий запуск: summary актуален → переиспользование
+    res3 = run_report(cfg, force=False, figures=False, tables=False)
+    assert not res3["recomputed"] and res3["summary"]["generated_at"] == res2["summary"]["generated_at"]
     # скрипт 09 с YAML-конфигом
     cfg_path = stand["tmp"] / "cfg.yaml"
     cfg_path.write_text(yaml.safe_dump({k: v for k, v in cfg.items() if not k.startswith("_")}, allow_unicode=True), encoding="utf-8")
@@ -481,4 +506,215 @@ def test_report_and_scripts(stand: dict[str, Any], monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(RE, "make_index", lambda name, c: DummyIndex(c))
     assert _load_script("07_eval").main(["--config", str(cfg_path), "--methods", "exact", "--sets", "hard_neg", "--limit", "7"]) == 0
     assert json.loads(capsys.readouterr().out)["exact"]["hard_neg"] == 7
-    assert len(list(read_jsonl(RE.scores_path(cfg, "exact", "hard_neg")))) == 7
+    assert not RE.scores_path(cfg, "exact", "hard_neg").exists()  # --limit не пишет полный файл
+    assert len(list(read_jsonl(RE.scores_path(cfg, "exact", "hard_neg", limit=7)))) == 7
+    assert "exact" not in M.available_methods(cfg)  # только усечённые файлы → метод не считается готовым
+
+
+# ----------------------------------------------------------------------------- регрессии после ревью
+
+
+def _scored(set_name: str, score: np.ndarray, source_id: np.ndarray, lang: str = "c") -> M.ScoredSet:
+    n = score.size
+    obj = lambda v: np.asarray([v] * n, dtype=object)  # noqa: E731
+    return M.ScoredSet(name=set_name, label=0, qid=source_id.copy(), score=score, latency=np.full(n, np.nan), transform=obj("identity"),
+                       lang=obj(lang), n_tokens=np.full(n, 10), L=np.full(n, -1), repo=obj("r"), source_id=source_id,
+                       dst_lang=obj(""), best_id=obj(""), n_queries=n)
+
+
+def test_fpr_cluster_ci_accounts_for_clustering():
+    """Превышения порога кластеризованы по функции (все 13 запросов функции) → кластерный ДИ заметно шире Клоппера–Пирсона."""
+    rng = np.random.default_rng(7)
+    n_fun, per = 400, 13
+    sid = np.repeat([f"f{i}" for i in range(n_fun)], per).astype(object)
+    hot = rng.random(n_fun) < 0.02
+    ss = _scored("public_test", np.where(np.repeat(hot, per), 0.9, 0.1), sid)
+    boot = M.ClusterBootstrap(ss.source_id, 300, np.random.default_rng(1))
+    blk = M.fpr_block(ss, 0.5, boot=boot)
+    cp_w, cl_w = blk["ci"][1] - blk["ci"][0], blk["ci_cluster"][1] - blk["ci_cluster"][0]
+    assert cl_w > 2 * cp_w and blk["ci_cluster"][0] <= blk["value"] <= blk["ci_cluster"][1]
+    assert "ci_cluster" in blk["max_subgroup"] and blk["by_lang"]["c"]["ci_cluster"] is not None
+    assert M.fpr_block(ss, 0.5)["ci_cluster"] is None  # без бутстрэпа — только Клоппер–Пирсон
+    assert fmt_ci_cluster(blk) != fmt_ci(blk) and fmt_ci_cluster({"value": 0.5, "ci": [0.4, 0.6]}) == "0.500 [0.400, 0.600]"
+
+
+def test_one_per_cluster_and_tie_mass():
+    sid = np.asarray(["a", "b", "a", "c", "b", "a"], dtype=object)
+    mask = M.one_per_cluster(sid, np.random.default_rng(0))
+    assert mask.sum() == 3 and sorted(sid[mask].tolist()) == ["a", "b", "c"]
+    assert np.array_equal(mask, M.one_per_cluster(sid, np.random.default_rng(0)))  # детерминизм
+    assert M.tie_mass(np.array([0.0, 0.0, 0.0, 0.5]), 0.0) == 0.75 and M.tie_mass(np.array([0.1]), float("inf")) is None
+
+
+def test_end_to_end_latency_composition():
+    lat = {"p50": 1.0, "p95": 2.0}
+    assert M.end_to_end_latency(lat, None, ["per_query"], None)["p95"] == 2.0
+    e = M.end_to_end_latency({"p50": 0.001, "p95": 0.0015}, None, ["batch_amortized(batch=256)"], {})
+    assert e["p95"] is None and "latency_encoder" in e["reason"]
+    enc = {"cpu1": {"p50_ms": 40.0, "p95_ms": 55.0}}
+    e = M.end_to_end_latency({"p50": 0.001, "p95": 0.0015}, None, ["batch_amortized(batch=256)"], enc)
+    assert e["p95"] is None and "--bench" in e["reason"]
+    bench = {"mode": "numpy_batch1", "p50_ms": 3.0, "p95_ms": 5.0}
+    e = M.end_to_end_latency({"p50": 0.001, "p95": 0.0015}, bench, ["batch_amortized(batch=256)"], enc)
+    assert e["p95"] == 60.0 and e["p50"] == 43.0 and e["components"]["encoder"]["p95"] == 55.0
+    e = M.end_to_end_latency(lat, {"mode": "query", "p50_ms": 30.0, "p95_ms": 42.0}, ["amortized_batch(batch=64)"], None)
+    assert e["p95"] == 42.0 and "query()" in e["source"]
+    assert M.end_to_end_latency(lat, bench, ["amortized_batch(batch=64)"], enc)["p95"] is None  # numpy-бенчмарк не содержит энкодер
+
+
+def test_f7_skips_amortized_method_without_end_to_end(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    """F7 не рисует амортизированное время батча как латентность запроса: без сквозной оценки метод пропускается."""
+    base = {"n_records": 1000, "latency_ms": {"p50": 0.001, "p95": 0.0015, "mode": "batch_amortized(batch=256)",
+                                              "end_to_end": {"p50": None, "p95": None, "source": None, "components": {}, "reason": "нет бенчмарка"}}}
+    summary = {"methods": {"semantic": base}, "alpha_keys": ["0.01"]}
+    assert latency_point(summary, "semantic") is None
+    with caplog.at_level("WARNING", logger="smcode.eval.plots"):
+        assert fig_F7(summary, None, tmp_path / "f7.png") is None
+    assert any("F7" in r.message and "semantic" in r.message for r in caplog.records)
+    ok = {**base, "latency_ms": {**base["latency_ms"], "end_to_end": {"p50": 43.0, "p95": 60.0, "source": "x", "components": {}, "reason": None}}}
+    summary["methods"]["semantic"] = ok
+    assert latency_point(summary, "semantic") == (1000.0, 60.0, "энкодер CPU-1 + поиск, батч 1")
+    assert fig_F7(summary, None, tmp_path / "f7.png") is not None and (tmp_path / "f7.png").exists()
+    pq = {"n_records": 500, "latency_ms": {"p50": 1.0, "p95": 2.0, "mode": "per_query", "end_to_end": {"p50": 1.0, "p95": 2.0, "source": "per_query", "components": {}, "reason": None}}}
+    assert latency_point({"methods": {"exact": pq}}, "exact") == (500.0, 2.0, "прогон eval")
+
+
+def test_f6_zero_f1_point_is_kept():
+    defs = [{"name": "none", "tpr": {"semantic": 0.8}, "attacks": {"A2": {"100": {"f1": 0.8}, "10000": {"f1": 0.9}}}},
+            {"name": "strong", "tpr": {"semantic": {"value": 0.7}}, "attacks": {"A2": {"100": {"f1": 0.0}, "10000": {"f1": 0.0}}}},
+            {"name": "no-a2", "tpr": {"hybrid": 0.75}, "attacks": {"A2": None}}]
+    xs, ys = privacy_points(defs, "10000")
+    assert xs.tolist()[:2] == [0.9, 0.0] and np.isnan(xs[2]) and ys.tolist() == [0.8, 0.7, 0.75]
+
+
+class DummyAmortized(DummyIndex):
+    """query_batch амортизирует батч, как SemanticIndex/HybridIndex (details["latency_mode"] = "amortized_batch")."""
+
+    query_batch_size = 8
+
+    def query_batch(self, items: list[tuple[str, str]]) -> list[QueryResult]:
+        out = []
+        for code, lang in items:
+            r = self.query(code, lang)
+            r.latency_ms, r.details["latency_mode"] = 0.1, "amortized_batch"
+            out.append(r)
+        return out
+
+
+def test_amortized_batch_mode_is_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg, rows = _prepare_eval(tmp_path, monkeypatch, {"semantic": DummyAmortized})
+    meta = RE.eval_method(cfg, "semantic", sets=["public_test"], bench=2)["public_test"]
+    assert meta["latency_mode"] == "amortized_batch(batch=8)" and meta["latency_benchmark"]["mode"] == "query"
+    summary = M.compute_summary(cfg, bootstrap=5)
+    lat = summary["methods"]["semantic"]["latency_ms"]
+    assert lat["mode"] == "amortized_batch(batch=8)" and lat["end_to_end"]["p95"] == meta["latency_benchmark"]["p95_ms"]
+
+
+def test_numpy_path_end_to_end_needs_encoder_and_bench(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg, rows = _prepare_eval(tmp_path, monkeypatch, {"semantic": DummySemantic})
+    emb = np.random.default_rng(0).random((len(rows), 8)).astype(np.float16)
+    p = RE.query_embeddings_path(cfg, "public_test")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(p, qids=np.asarray([r["qid"] for r in rows]), emb=emb)
+    RE.eval_method(cfg, "semantic", sets=["public_test"], batch=4)
+    e = M.compute_summary(cfg, bootstrap=5)["methods"]["semantic"]["latency_ms"]["end_to_end"]
+    assert e["p95"] is None and e["reason"]
+    with open(Path(cfg["paths"]["results"]) / "latency_encoder.json", "w") as f:
+        json.dump({"cpu_threads_all": 4, "configs": [{"device": "cpu", "threads": 1, "batch": 1, "p50_ms": 40.0, "p95_ms": 55.0, "per_item_ms": 40.0}]}, f)
+    RE.eval_method(cfg, "semantic", sets=["public_test"], batch=4, bench=2, force=True)
+    lat = M.compute_summary(cfg, bootstrap=5)["methods"]["semantic"]["latency_ms"]
+    assert lat["benchmark"]["mode"] == "numpy_batch1" and lat["end_to_end"]["p95"] == pytest.approx(55.0 + lat["benchmark"]["p95_ms"])
+    assert lat["end_to_end"]["components"]["encoder"]["p95"] == 55.0
+
+
+def test_variant_eval_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Абляция: out_name / index_path / cfg_overrides → отдельный каталог скоров, meta с описанием, подхват в summary/T4."""
+    cfg, rows = _prepare_eval(tmp_path, monkeypatch, {"hybrid": DummyHybrid})
+    alt = tmp_path / "alt_index"
+    alt.mkdir()
+    ov = {"semantic": {"hybrid_rule": "two_threshold"}}
+    res = RE.run_eval(cfg, methods=["hybrid"], sets=["public_test"], out_name="hybrid_rule", index_path=alt, cfg_overrides=ov)
+    meta = res["hybrid"]["public_test"]
+    assert meta["variant"] == "hybrid_rule" and meta["method"] == "hybrid" and meta["index_dir"] == str(alt) and meta["cfg_overrides"] == ov
+    assert RE.scores_path(cfg, "hybrid_rule", "public_test").exists() and not RE.scores_path(cfg, "hybrid", "public_test").exists()
+    assert cfg["semantic"]["hybrid_rule"] == "logistic"  # исходный конфиг не изменён
+    assert RE.eval_method(cfg, "hybrid", sets=["public_test"], out_name="hybrid_rule") == {"public_test": {"skipped": True}}
+    with pytest.raises(ValueError):
+        RE.run_eval(cfg, methods=["hybrid", "exact"], out_name="x")
+    summary = M.compute_summary(cfg, bootstrap=5)
+    assert list(summary["methods"]) == ["hybrid_rule"]
+    v = summary["methods"]["hybrid_rule"]["variant"]
+    assert v["base_method"] == "hybrid" and v["cfg_overrides"] == ov and v["index_dir"] == str(alt)
+    assert "semantic.hybrid_rule=two_threshold" in variant_description(summary, "hybrid_rule") and "M4 hybrid" in variant_description(summary, "hybrid_rule")
+    assert "M4 правило двух порогов" in table_T4(summary) and "semantic.hybrid_rule=two_threshold" in table_T4(summary)
+    assert RE.parse_overrides(["a.b=1", "a.c=x y", "d={k: 0.5}", "e="]) == {"a": {"b": 1, "c": "x y"}, "d": {"k": 0.5}, "e": None}
+    with pytest.raises(ValueError):
+        RE.parse_overrides(["novalue"])
+
+
+def test_variant_eval_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    cfg, rows = _prepare_eval(tmp_path, monkeypatch, {"exact": DummyIndex})
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump({k: v for k, v in cfg.items() if not k.startswith("_")}, allow_unicode=True), encoding="utf-8")
+    alt = tmp_path / "alt"
+    alt.mkdir()
+    main = _load_script("07_eval").main
+    assert main(["--config", str(cfg_path), "--methods", "exact", "--variant", "exact_w3", "--index-dir", str(alt),
+                 "--set", "fingerprint.exact_window=3", "--sets", "public_test"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"exact_w3": {"public_test": len(rows)}}
+    meta = RE.read_scores_meta(cfg, "exact_w3", "public_test")
+    assert meta["cfg_overrides"] == {"fingerprint": {"exact_window": 3}} and meta["index_dir"] == str(alt)
+    with pytest.raises(SystemExit):  # --variant с двумя методами
+        main(["--config", str(cfg_path), "--methods", "exact,winnowing", "--variant", "x"])
+    with pytest.raises(SystemExit):  # имя варианта не из REGISTRY
+        main(["--config", str(cfg_path), "--methods", "exact_w3"])
+
+
+def test_report_recomputes_on_stale_summary(tmp_path: Path):
+    """Новый каталог скоров или более новый файл скоров → summary.json пересчитывается без --force."""
+    cfg = _make_cfg(tmp_path)
+    rng = np.random.default_rng(4)
+    qdir = Path(cfg["paths"]["queries"])
+    queries = {s: _make_queries(s, 12, ["a", "b"], rng) for s in ("protected", "public_calib", "public_test")}
+    for s, q in queries.items():
+        write_jsonl(qdir / f"{s}.jsonl", q)
+
+    def _scores(m: str) -> None:
+        for s, q in queries.items():
+            d = (5.0, 2.0) if s == "protected" else (2.0, 5.0)
+            write_jsonl(RE.scores_path(cfg, m, s), [{"qid": r["qid"], "score": float(rng.beta(*d)), "best_id": None, "latency_ms": 1.0} for r in q])
+
+    _scores("winnowing")
+    res = run_report(cfg, bootstrap=5, figures=False, tables=False)
+    assert res["recomputed"]
+    res = run_report(cfg, figures=False, tables=False)
+    assert not res["recomputed"] and summary_is_stale(cfg, M.load_summary(cfg), res["summary_path"]) is None
+    _scores("hybrid_rule")  # новый вариант появился после отчёта
+    res = run_report(cfg, figures=False, tables=False)
+    assert res["recomputed"] and set(res["summary"]["methods"]) == {"winnowing", "hybrid_rule"}
+    import os, time
+    sp = RE.scores_path(cfg, "winnowing", "protected")
+    os.utime(sp, (time.time() + 5, time.time() + 5))  # скоры «новее» summary.json
+    res = run_report(cfg, figures=False, tables=False)
+    assert res["recomputed"] and "новее" in res["reason"]
+    res = run_report(cfg, methods=["winnowing"], figures=False, tables=False)
+    assert res["recomputed"] and list(res["summary"]["methods"]) == ["winnowing"]
+
+
+def test_incomplete_scores_are_flagged(tmp_path: Path):
+    """Полный файл скоров, усечённый старым --limit (meta.limit) → пересчёт в eval, пометка incomplete в summary и таблицах."""
+    cfg = _make_cfg(tmp_path)
+    rng = np.random.default_rng(5)
+    qdir = Path(cfg["paths"]["queries"])
+    q = {s: _make_queries(s, 10, ["a"], rng) for s in ("protected", "public_calib")}
+    for s, rows in q.items():
+        write_jsonl(qdir / f"{s}.jsonl", rows)
+        write_jsonl(RE.scores_path(cfg, "exact", s), [{"qid": r["qid"], "score": float(rng.random()), "best_id": None, "latency_ms": None} for r in rows[:7]])
+        with open(RE.meta_path(cfg, "exact", s), "w") as f:
+            json.dump({"limit": 7, "latency_mode": "per_query"}, f)
+    assert not RE._is_done(cfg, "exact", "protected", None)
+    summary = M.compute_summary(cfg, bootstrap=5)
+    inc = summary["methods"]["exact"]["incomplete"]
+    assert inc["protected"] == {"n": 7, "n_queries": 70} and summary["warnings"] and "exact" in summary["warnings"][0]
+    assert "Неполные скоры" in write_tables(cfg, summary)["T2"].read_text(encoding="utf-8")
+    assert "⚠" in format_summary(summary)

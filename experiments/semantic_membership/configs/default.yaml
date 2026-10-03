@@ -6,6 +6,8 @@ paths:
   functions: data/functions      # {split}.jsonl
   queries: data/queries          # {set}.jsonl
   indexes: data/indexes
+  embeddings: data/embeddings    # {split}.npz, queries/{set}.npz, by_model/<tag>/ (кэш по моделям)
+  runs: runs                     # чекпойнты обучения (scripts/05_train_encoder.py)
   results: results
   figures: ../../paper/figures
 languages: [python, c, cpp, go, java, javascript]
@@ -13,53 +15,88 @@ extract:
   min_lines: 3
   max_lines: 300
   max_tokens: 2048
+  # к этому списку extract.py всегда добавляет EXTRA_SKIP_DIRS (__tests__, fixtures, docs, samples, 3rdparty, t, ...)
   skip_dirs: [vendor, third_party, thirdparty, external, deps, node_modules, test, tests, testdata, examples, benchmarks, build, dist, contrib, submodules]
+  domain_path_filter: true       # public_*: пропускать файлы с доменом protected в пути (crypto/tls/ssh/...), см. extract_stats.json
+  skip_test_files: true          # пропускать тестовые файлы по имени (*_test.go, test_*.py, *Test.java, ...)
 dedup:
   k: 25                          # k-грамма для near-dup фильтра между сплитами
   w: 25
   overlap_threshold: 0.3         # доля общих отпечатков, выше которой функция считается дубликатом
+  sha_protected_min_tokens: 0    # негативы с тем же нормализованным sha, что у protected (тип-2 клоны), удаляются начиная с этой
+                                 # длины в токенах; 0 — все (иначе короткие клоны остаются негативами с меткой 0 и повышают FPR в бине 0–32)
 splits:                          # доли репозиториев public-корпуса
   public_train: 0.6
   public_calib: 0.2
   public_test: 0.2
-windows:                         # файловые окна protected (сценарий IDE, kind: window)
+windows:                         # файловые окна (сценарий IDE, kind: window), data/functions/<split>_windows.jsonl
   size: 20
   stride: 10
+  splits: [protected, public_calib, public_test]   # protected — члены (индекс + набор protected_windows); public_* — негативы той же
+                                                   # формы (наборы public_calib_windows / public_test_windows: порог и FPR для окон)
 transforms:
   max_per_split: 5000            # функций на набор запросов (стратификация по языку и бину длины)
   programmatic: [identity, reformat, strip_comments, rename_ids, change_literals, insert_deadcode, reorder_stmts, combo]
   partial_lines: [3, 5, 10, 20, 40]
   deadcode_every: 3              # вставка no-op каждые N строк (атака в стиле Mossad)
+  deadcode_templates: eval       # шаблоны no-op для НАБОРОВ ЗАПРОСОВ: eval (отдельный набор, не виденный при обучении) | train
   llm: [paraphrase, translate]   # только на GPU-машине, см. transforms/llm_paraphrase.py
   llm_model: Qwen/Qwen2.5-Coder-7B-Instruct
   llm_sample_per_split: 5000
+  llm_temperature: 0.2           # vLLM: сэмплирование генерации
+  llm_max_tokens: 2048           # vLLM: максимум токенов ответа
+  llm_max_model_len: 8192        # vLLM: контекст модели (память KV-кэша)
+  llm_gpu_memory_utilization: 0.9
+  llm_tensor_parallel: 1
 fingerprint:
   k: 25
   w: 25
+  token_mode: full               # токены отпечатков M1/M2/M4: full (ID/NUM/STR, инвариант к T1–T4/combo по построению) |
+                                 # lexical (классический Moss по лексическим токенам; вариант winnowing_lexical, см. README §8)
+  workers: 4                     # процессов при сборке отпечатков (scripts/04 --workers)
   hmac_key_env: SMCODE_INDEX_KEY  # ключ HMAC для отпечатков (не хранить в репозитории)
   minhash_perm: 128
   minhash_shingle: 5
   minhash_lsh_threshold: 0.3     # порог LSH для кандидатов M2
+  minhash_max_candidates: 200    # M2: точный Жаккар не более чем для стольких LSH-кандидатов (ранжирование по подписям)
   exact_window: 5                # M0: окна по 5 строк, keyed blake2b-64
   common_df: 50                  # фильтр общности M1: df по функциям public_train
   common_file_frac: 0.05         # ... или доля файлов protected
   common_min_files: 3            # ... и не менее стольких файлов protected
 semantic:
   base_model: microsoft/unixcoder-base
+  checkpoint: null               # дообученный энкодер (runs/<name>/best); null = zero-shot base_model. Шаги 04/06/07/08 берут модель отсюда
+  trust_remote_code: false       # нужно true для codesage/codesage-small и других моделей с кастомным кодом
+  input_prefix: null             # префикс режима энкодера (null — по базовой модели: UniXcoder → <encoder-only>)
+  fp16: true                     # инференс в fp16 на CUDA (на CPU всегда fp32)
   max_length: 512
   pooling: mean
+  query_batch_size: 32           # батч энкодера в query_batch (латентность амортизируется; 1 — честная латентность одного запроса)
+  use_faiss: null                # ANN: null — faiss, если установлен, иначе numpy; true/false — принудительно
+  index_fp16: true               # матрица индекса на диске в float16
+  reuse_embeddings: true         # 04 берёт готовые data/embeddings/<split>.npz той же модели вместо кодирования
+  val_on: holdout                # отбор лучшей эпохи: holdout (репозитории public_train) | public_calib (DESIGN §7 буквально)
   temperature: 0.05
-  batch_size: 128
+  batch_size: 128                # якорей в батче обучения (и батч энкодера в 06/04); 24 ГБ → 05 --batch_size 32, 40–48 ГБ → 64
+  grad_accum: 1                  # шагов накопления градиента: эффективный батч = batch_size × grad_accum (контраст — внутри микробатча)
+  grad_checkpointing: true       # DESIGN §7; без него batch 128 × (1 + 1 + 2 негатива) × 512 токенов не помещается на одной GPU
   epochs: 2
   lr: 2.0e-5
   warmup_frac: 0.05
   weight_decay: 0.01
   own_lr: 3.0e-4                 # скорость обучения own_small_model
   hard_negatives_per_anchor: 2
+  exclude_transforms: []         # преобразования, НЕ используемые как позитивы при дообучении и обучении комбинатора
+                                 # (абляция «неизвестный класс»: например [insert_deadcode, reorder_stmts]; partial — тоже допустим)
+  train_transforms: null         # явный список позитивов обучения (null — transforms.programmatic минус exclude_transforms)
+  rename_styles: null            # стили rename_ids при обучении (null — все: vn, snake, camel, short; абляция: [vn])
   ann_top_k: 20
   hybrid_rule: logistic          # logistic | two_threshold (абляция)
   hybrid_thresholds: {cos: 0.8, overlap: 0.2}   # правило двух порогов, формула (9) статьи
+  allow_rule_fallback: false     # true: без обученного комбинатора hybrid откатывается к two_threshold вместо ошибки
   combiner_C: 1.0
+  combiner_path: null            # явный файл комбинатора (null — data/indexes/hybrid/combiner_<model_tag>.pkl)
+  combiner_force: false          # переобучить комбинатор даже при совпадении сигнатуры
   combiner_n_index: 20000        # обучение комбинатора на public_train (половина репозиториев)
   combiner_n_anchors: 2000
   combiner_n_neg: 2000           # функции второй половины репозиториев (вне индекса)
@@ -74,12 +111,27 @@ calibration:
   method: split_conformal        # порог = ⌈(n+1)(1-alpha)⌉-я порядковая статистика скоров негативов; решение score > τ
   domain_calib_fraction: 0.5     # доля репозиториев hard_neg в доменной калибровке (остальные — тест)
 privacy:
-  projection: keyed_orthogonal
+  projection: keyed_orthogonal   # ключ: $SMCODE_PROJECTION_KEY (иначе $SMCODE_INDEX_KEY, иначе seed с предупреждением)
   quant_bits: [8, 4, 1]
-  noise_sigma: [0.0, 0.05, 0.1, 0.2]
+  noise_mode: relative           # σ относительно нормы вектора (DESIGN §9); absolute — покоординатно
+  noise_sigma: [0.0, 0.05, 0.1, 0.2]   # если все σ дают cos > 0.97, run.py дополняет сетку σ ∈ {0.25, 0.5, 1, 2} (предупреждение)
   attack_leaked_pairs: [0, 100, 1000, 10000]
+  align_method: procrustes       # оценка Q̂ в A2 (ортогональный Прокруст)
+  bootstrap: 1000                # кластерный бутстрэп ДИ полезности (по исходной функции запроса)
+  a1_train_max: 50000            # функций public_train для обучения A1 (ограничивает время шага 08)
+  a1_eval_max: 10000             # функций protected для оценки атак
+  leak_pool_max: 20000           # пул пар (код, вектор) для A2 (не меньше max(attack_leaked_pairs))
   bow_vocab: 20000
+  a1_min_precision: 0.1          # порог на токен A1 выбирается среди отсечек с precision ≥ и F1 ≥ (иначе токен не предсказывается)
+  a1_min_f1: 0.1
+  a1_backend: auto               # auto (torch MLP, если есть, иначе ridge) | torch | ridge
+  a1_hidden: 1024                # MLP A1 (torch): скрытый слой, эпохи, lr, батч
+  a1_epochs: 10
+  a1_lr: 1.0e-3
+  a1_batch: 256
+  utility_hybrid: true           # полезность M4 под защитами (нужны коды запросов data/queries/<set>.jsonl и комбинатор M4)
 eval:
   bootstrap: 1000
   latency_repeats: 200
+  latency_threads: [1, 4]        # CPU-потоки при замере латентности энкодера (scripts/06_embed.py)
   length_bins_tokens: [[0, 32], [32, 64], [64, 128], [128, 256], [256, 100000]]

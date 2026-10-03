@@ -23,7 +23,7 @@ from smcode.eval.build_queries import ALL_SETS, build_queries  # noqa: E402
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Построение наборов запросов (программные и LLM-преобразования).")
     ap.add_argument("--config", default="configs/default.yaml", help="путь к YAML-конфигу")
-    ap.add_argument("--sets", nargs="*", default=None, help=f"наборы (по умолчанию: {' '.join(ALL_SETS)})")
+    ap.add_argument("--sets", nargs="*", default=None, help=f"наборы (по умолчанию: {' '.join(ALL_SETS)} + <split>_windows из cfg.windows.splits)")
     ap.add_argument("--max-per-split", type=int, default=None, help="максимум функций на набор (cfg: transforms.max_per_split, 5000)")
     ap.add_argument("--force", action="store_true", help="перестроить, даже если файлы уже есть")
     ap.add_argument("--llm", action="store_true", help="добавить LLM-преобразования paraphrase/translate (GPU, vLLM)")

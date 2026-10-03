@@ -1,0 +1,9 @@
+# Артефакты стенда (якорённые шаблоны: только каталоги верхнего уровня этого стенда).
+/data/
+/results/
+/runs/
+.pytest_cache/
+__pycache__/
+# Корневой .gitignore репозитория содержит неякорённый шаблон `data/`, который скрывает и пакет
+# smcode/data/ (list_repos.py, extract.py, windows.py, dedup_split.py). Возвращаем его в git.
+!/smcode/data/

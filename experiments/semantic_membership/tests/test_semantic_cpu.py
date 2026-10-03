@@ -461,12 +461,429 @@ def test_train_combiner_from_corpus_and_ensure_combiner(tmp_path):
     comb = train_combiner_from_corpus(cfg, encoder=enc)
     assert comb.fitted and Path(cfg["semantic"]["combiner_path"]).exists()
     assert comb.train_stats["n_pos"] > 0 and comb.train_stats["train_auc"] > 0.9
-    # ensure_combiner подхватывает сохранённый файл без обучения
+    assert comb.train_stats["model"] == "fake-hash" and comb.train_stats["k"] == 5 and comb.train_stats["top_k"] == 5
+    # ensure_combiner подхватывает сохранённый файл без обучения (индекс той же модели)
     h = HybridIndex(cfg)
     prot = _records(10)
-    h.build_from_embeddings([r.id for r in prot], enc.encode([r.code for r in prot]), [r.code for r in prot], ["python"] * 10)
+    h.build_from_embeddings([r.id for r in prot], enc.encode([r.code for r in prot]), [r.code for r in prot], ["python"] * 10,
+                            meta={"model": enc.model_name})
     got = h.ensure_combiner(cfg, encoder=None)
-    assert got.fitted and h.rule == "logistic" and h.meta["combiner"]["fitted"] is True
-    scores, best, _ = h.score_embeddings_with_codes(enc.encode([prot[2].code]), [prot[2].code], ["python"])
+    assert got.fitted and h.rule == "logistic" and h.meta["combiner"]["fitted"] is True and h.meta["combiner_fitted"] is True
+    scores, best, details = h.score_embeddings_with_codes(enc.encode([prot[2].code]), [prot[2].code], ["python"])
     assert best[0] == prot[2].id and scores[0] > 0.5
+    assert details[0]["rule"] == "logistic" and details[0]["combiner_fitted"] is True
     assert "torch" not in sys.modules
+
+
+# ----------------------------------------------------------------------------- регрессии после ревью
+
+
+class _NamedEncoder:
+    """Фейковый энкодер с заданным именем модели; считает вызовы encode."""
+
+    def __init__(self, model_name: str, d: int = 8, fill: float = 0.5, max_length: int = 512):
+        self.model_name = model_name
+        self.max_length = max_length
+        self.device = "cpu"
+        self.kind = "fake"
+        self.d = d
+        self.fill = fill
+        self.calls: list[list[str]] = []
+
+    def encode(self, codes, langs=None, batch_size=32, show_progress=False):
+        self.calls.append(list(codes))
+        return l2_normalize(np.full((len(codes), self.d), self.fill, dtype=np.float32) + np.arange(self.d, dtype=np.float32) * 0.01)
+
+
+def test_model_key_and_tag(tmp_path):
+    from smcode.config import ROOT as PKG_ROOT
+    from smcode.semantic.model import expected_model_key, model_key, model_tag, resolve_model_name
+
+    assert model_key("microsoft/unixcoder-base") == "microsoft/unixcoder-base"
+    assert model_key(None) == "" and model_key("") == ""
+    assert model_tag("microsoft/unixcoder-base") == "microsoft__unixcoder-base"
+    # относительный и абсолютный путь к каталогу внутри стенда дают один ключ
+    runs_existed = (PKG_ROOT / "runs").exists()
+    run = PKG_ROOT / "runs" / "_test_model_key_tmp" / "best"
+    run.mkdir(parents=True, exist_ok=True)
+    try:
+        assert model_key("runs/_test_model_key_tmp/best") == "runs/_test_model_key_tmp/best"
+        assert model_key(str(run)) == "runs/_test_model_key_tmp/best"
+        assert model_key("runs/_test_model_key_tmp/best/") == "runs/_test_model_key_tmp/best"
+        assert model_tag(str(run)) == "runs___test_model_key_tmp__best"
+        cfg = {"semantic": {"checkpoint": "runs/_test_model_key_tmp/best", "base_model": "x/y"}}
+        assert resolve_model_name(cfg) == str(run) and expected_model_key(cfg) == "runs/_test_model_key_tmp/best"
+    finally:
+        run.rmdir()
+        run.parent.rmdir()
+        if not runs_existed:
+            (PKG_ROOT / "runs").rmdir()
+    assert expected_model_key({"semantic": {"base_model": "x/y"}}) == "x/y"
+    # каталог вне стенда → абсолютный путь
+    outside = tmp_path / "ckpt"
+    outside.mkdir()
+    assert model_key(outside) == str(outside.resolve())
+
+
+def test_embeddings_reuse_is_keyed_on_model(tmp_path):
+    """Блокер: векторы другой модели не переиспользуются и не выдаются за текущую."""
+    from smcode.semantic.embed import cached_split_path, embeddings_for_records_ex, read_embeddings_meta
+
+    cfg = _cfg(tmp_path)
+    rng = np.random.default_rng(11)
+    ids = [f"protected/r/f{i}" for i in range(6)]
+    E = _unit(rng, 6, 8)
+    save_embeddings(tmp_path / "embeddings" / "protected.npz", ids, E, key="ids", meta={"model": "microsoft/unixcoder-base", "max_length": 512})
+    # другой энкодер → ничего не переиспользуется, кодируется всё
+    enc_b = _NamedEncoder("runs/finetuned/best")
+    out, info = embeddings_for_records_ex(cfg, enc_b, ids[:4], ["c"] * 4, ["python"] * 4, split="protected")
+    assert info["n_reused"] == 0 and info["n_encoded"] == 4 and info["model"] == "runs/finetuned/best"
+    assert enc_b.calls == [["c"] * 4] and not np.allclose(out[0], E[0], atol=2e-3)
+    # тот же энкодер → переиспользование без кодирования
+    enc_a = _NamedEncoder("microsoft/unixcoder-base")
+    out, info = embeddings_for_records_ex(cfg, enc_a, ids[:4], ["c"] * 4, ["python"] * 4, split="protected")
+    assert info["n_reused"] == 4 and info["n_encoded"] == 0 and enc_a.calls == [] and np.allclose(out, E[:4], atol=2e-3)
+    # фабрика: ожидаемая модель берётся из cfg (checkpoint/base_model), как в load_encoder
+    cfg_b = _cfg(tmp_path, checkpoint="runs/finetuned/best")
+    out, info = embeddings_for_records_ex(cfg_b, lambda: enc_b, ids[:2], ["c"] * 2, ["python"] * 2, split="protected")
+    assert info["n_reused"] == 0 and info["n_encoded"] == 2 and len(enc_b.calls) == 2
+    # энкодер, не совпадающий с запрошенной моделью, — ошибка, а не тихая подмена
+    with pytest.raises(ValueError):
+        embeddings_for_records_ex(cfg_b, enc_a, ["new/id"], ["c"], ["python"], split="protected", model="runs/finetuned/best")
+    with pytest.raises(ValueError):
+        embeddings_for_records_ex(cfg_b, lambda: enc_a, ["new/id"], ["c"], ["python"], split="protected")  # cfg ждёт finetuned
+    # файл без meta.model не считается проверенным
+    save_embeddings(tmp_path / "embeddings" / "hard_neg.npz", ids[:2], E[:2], key="ids", meta={})
+    out, info = embeddings_for_records_ex(cfg, enc_a, ids[:2], ["c"] * 2, ["python"] * 2, split="hard_neg")
+    assert info["n_reused"] == 0 and info["n_encoded"] == 2
+    assert not cached_split_path(cfg, "protected", "runs/finetuned/best").exists()
+    assert read_embeddings_meta(tmp_path / "nope.npz") == {}
+
+
+def test_embed_split_replaces_stale_files_and_keeps_model_cache(tmp_path):
+    """Блокер: 06 с другим чекпойнтом перекодирует активные файлы; старые остаются в by_model/<tag>."""
+    from smcode.semantic.embed import cached_query_path, cached_split_path, embed_query_set, embed_split, read_embeddings_meta
+    from smcode.types import write_jsonl
+
+    cfg = _cfg(tmp_path)
+    recs = _records(5, split="protected")
+    write_jsonl(Path(cfg["paths"]["functions"]) / "protected.jsonl", recs)
+    write_jsonl(Path(cfg["paths"]["queries"]) / "protected.jsonl",
+                [{"qid": f"q{i}", "code": r.code, "lang": "python"} for i, r in enumerate(recs)])
+    enc_a = _NamedEncoder("model-A", fill=0.1)
+    enc_b = _NamedEncoder("model-B", fill=0.9)
+    active = embed_split(cfg, "protected", enc_a)
+    assert active == tmp_path / "embeddings" / "protected.npz" and read_embeddings_meta(active)["model"] == "model-A"
+    assert cached_split_path(cfg, "protected", "model-A").exists()
+    assert embed_split(cfg, "protected", enc_a) == active and len(enc_a.calls) == 1  # идемпотентно для той же модели
+    # другая модель: активный файл заменяется, A остаётся в кэше
+    embed_split(cfg, "protected", enc_b)
+    assert read_embeddings_meta(active)["model"] == "model-B" and len(enc_b.calls) == 1
+    assert read_embeddings_meta(cached_split_path(cfg, "protected", "model-A"))["model"] == "model-A"
+    _, emb_b, _ = load_embeddings(active)
+    # возврат к A: восстановление из кэша без кодирования
+    embed_split(cfg, "protected", enc_a)
+    assert read_embeddings_meta(active)["model"] == "model-A" and len(enc_a.calls) == 1
+    _, emb_a, _ = load_embeddings(active)
+    assert not np.allclose(emb_a, emb_b)
+    # max_length тоже часть ключа
+    enc_a_short = _NamedEncoder("model-A", fill=0.1, max_length=128)
+    embed_split(cfg, "protected", enc_a_short)
+    assert len(enc_a_short.calls) == 1 and read_embeddings_meta(active)["max_length"] == 128
+    # наборы запросов: та же логика
+    qp = embed_query_set(cfg, "protected", enc_b)
+    assert qp is not None and read_embeddings_meta(qp)["model"] == "model-B" and cached_query_path(cfg, "protected", "model-B").exists()
+    embed_query_set(cfg, "protected", enc_a)
+    assert read_embeddings_meta(qp)["model"] == "model-A"
+    assert embed_split(cfg, "public_test", enc_a) is None  # нет файла функций
+
+
+def test_semantic_index_build_records_true_producer_model(tmp_path):
+    """Блокер: meta.model индекса — модель, которой получены векторы, и чужие npz не подхватываются."""
+    cfg = _cfg(tmp_path, checkpoint="model-A")
+    recs = _records(6, split="protected")
+    enc_a = _NamedEncoder("model-A", fill=0.2)
+    E = enc_a.encode([r.code for r in recs])
+    enc_a.calls.clear()
+    save_embeddings(tmp_path / "embeddings" / "protected.npz", [r.id for r in recs], E, key="ids", meta={"model": "model-A"})
+    idx = SemanticIndex(cfg)
+    idx.set_encoder(enc_a)
+    idx.build(recs, cfg)
+    assert idx.meta["model"] == "model-A" and idx.meta["n_reused"] == 6 and idx.meta["n_encoded"] == 0 and enc_a.calls == []
+    # файл другой модели: кодируется заново своим энкодером, meta.model — честный
+    cfg_b = _cfg(tmp_path, checkpoint="model-B")
+    enc_b = _NamedEncoder("model-B", fill=0.7)
+    idx_b = SemanticIndex(cfg_b)
+    idx_b.set_encoder(enc_b)
+    idx_b.build(recs, cfg_b)
+    assert idx_b.meta["model"] == "model-B" and idx_b.meta["n_reused"] == 0 and idx_b.meta["n_encoded"] == 6 and len(enc_b.calls) == 1
+    # без энкодера индекс модели B не может «одолжить» векторы A
+    idx_c = SemanticIndex(cfg_b)
+    with pytest.raises(Exception):
+        idx_c.build(recs, cfg_b)  # фабрика → load_encoder → нет torch (и не было бы реюза A)
+    assert "torch" not in sys.modules
+
+
+def test_combiner_path_respects_paths_indexes(tmp_path):
+    """Major: путь комбинатора — из cfg.paths.indexes, с тегом модели; явный combiner_path относителен корню стенда."""
+    from smcode.config import ROOT as PKG_ROOT
+    from smcode.semantic.hybrid import combiner_path
+
+    cfg = _cfg(tmp_path)
+    cfg["semantic"].pop("combiner_path")
+    p = combiner_path(cfg)
+    assert p == tmp_path / "indexes" / "hybrid" / "combiner.pkl"
+    assert combiner_path(cfg, "microsoft/unixcoder-base") == tmp_path / "indexes" / "hybrid" / "combiner_microsoft__unixcoder-base.pkl"
+    assert combiner_path(cfg, "runs/x/best").name == "combiner_runs__x__best.pkl"
+    assert not (PKG_ROOT / "data" / "indexes" / "hybrid" / "combiner.pkl").exists()
+    cfg["semantic"]["combiner_path"] = "data/custom/comb.pkl"
+    assert combiner_path(cfg, "any") == PKG_ROOT / "data" / "custom" / "comb.pkl"
+    cfg["semantic"]["combiner_path"] = str(tmp_path / "abs.pkl")
+    assert combiner_path(cfg) == tmp_path / "abs.pkl"
+
+
+def test_stale_combiner_is_retrained_on_model_change(tmp_path):
+    """Major: комбинатор другой модели/настроек не переиспользуется ни из файла, ни из индекса."""
+    from smcode.semantic.hybrid import combiner_matches, train_combiner_from_corpus
+    from smcode.types import write_jsonl
+
+    cfg = _cfg(tmp_path)
+    cfg["semantic"].pop("combiner_path")
+    cfg["transforms"] = {**cfg["transforms"], "programmatic": ["identity", "rename_ids"], "partial_lines": [5]}
+    cfg["semantic"].update({"combiner_n_index": 16, "combiner_n_anchors": 6, "combiner_n_neg": 6, "reuse_embeddings": False})
+    recs = _records(12, split="public_train", repo="a/one") + _records(12, split="public_train", repo="b/two")
+    for i, r in enumerate(recs):
+        r.id, r.code = f"public_train/{r.repo}/f{i}", _py_fn(400 + i)
+    write_jsonl(Path(cfg["paths"]["functions"]) / "public_train.jsonl", recs)
+
+    class EncA(_HashEncoder):
+        model_name = "model-A"
+
+    class EncB(_HashEncoder):
+        model_name = "runs/model-B-finetuned/best"
+
+    comb_a = train_combiner_from_corpus(cfg, encoder=EncA())
+    path_a = tmp_path / "indexes" / "hybrid" / "combiner_model-A.pkl"
+    assert path_a.exists() and comb_a.train_stats["model"] == "model-A"
+    # тот же файл, другая модель → переобучение (не возврат A)
+    comb_b = train_combiner_from_corpus(cfg, encoder=EncB(), out_path=path_a)
+    assert comb_b.train_stats["model"] == "runs/model-B-finetuned/best"
+    assert Combiner.load(path_a).train_stats["model"] == "runs/model-B-finetuned/best"
+    # сигнатура: k/w/top_k/C/key_id
+    sig = {"model": "model-A", "k": 5, "w": 4, "key_id": None, "top_k": 5, "C": 1.0}
+    assert combiner_matches(comb_a, sig)[0]
+    assert not combiner_matches(comb_a, {**sig, "k": 25})[0] and not combiner_matches(comb_a, {**sig, "C": 0.5})[0]
+    assert not combiner_matches(comb_a, {**sig, "key_id": "abcd"})[0] and not combiner_matches(Combiner("logistic"), sig)[0]
+    # ensure_combiner у индекса модели B: кэш A игнорируется (другое имя файла и сигнатура), берётся/обучается B
+    enc_b = EncB()
+    h = HybridIndex(cfg)
+    prot = _records(8)
+    h.build_from_embeddings([r.id for r in prot], enc_b.encode([r.code for r in prot]), [r.code for r in prot], ["python"] * 8,
+                            meta={"model": enc_b.model_name})
+    got = h.ensure_combiner(cfg, encoder=enc_b)
+    assert got.train_stats["model"] == "runs/model-B-finetuned/best"
+    # индекс с устаревшим комбинатором внутри (модель A) переобучает при ensure_combiner
+    h.set_combiner(comb_a)
+    assert h.combiner is comb_a
+    got2 = h.ensure_combiner(cfg, encoder=enc_b)
+    assert got2 is not comb_a and got2.train_stats["model"] == "runs/model-B-finetuned/best"
+    # а подходящий — оставляет без обучения; force переобучает
+    assert h.ensure_combiner(cfg, encoder=enc_b) is got2
+    got3 = h.ensure_combiner(cfg, encoder=enc_b, force=True)
+    assert got3 is not got2 and got3.fitted
+    cfg["semantic"]["combiner_C"] = 0.3
+    h2 = HybridIndex(cfg)
+    h2.build_from_embeddings([r.id for r in prot], enc_b.encode([r.code for r in prot]), [r.code for r in prot], ["python"] * 8,
+                             meta={"model": enc_b.model_name})
+    assert h2.ensure_combiner(cfg, encoder=enc_b).train_stats["C"] == pytest.approx(0.3)
+    assert "torch" not in sys.modules
+
+
+def test_hybrid_rule_from_config_honoured_on_load(tmp_path):
+    """Major: hybrid_rule из cfg действует при load(); обученный комбинатор сохраняется для обратного переключения."""
+    cfg, recs, M, h = _hybrid_fixture(tmp_path)
+    rng = np.random.default_rng(12)
+    q_emb = np.asarray([l2_normalize(M[i] + 0.2 * rng.standard_normal(M.shape[1]).astype(np.float32))[0] for i in range(30)]
+                       + [_unit(rng, 1, M.shape[1])[0] for _ in range(30)], dtype=np.float32)
+    q_codes = [r.code for r in recs] + [_py_fn(600 + i) for i in range(30)]
+    X, y, _ = collect_features(h, q_emb, q_codes, ["python"] * 60, [1] * 30 + [0] * 30, [r.id for r in recs] + ["x"] * 30)
+    h.set_combiner(Combiner(rule="logistic").fit(X, y))
+    out = tmp_path / "indexes" / "hybrid"
+    h.save(out)
+    s_log, _, d_log = h.score_embeddings_with_codes(q_emb[:5], q_codes[:5], ["python"] * 5)
+    # абляция по конфигурации, без пересборки
+    cfg_tt = _cfg(tmp_path, hybrid_rule="two_threshold", hybrid_thresholds={"cos": 0.7, "overlap": 0.3})
+    h_tt = HybridIndex(cfg_tt)
+    h_tt.load(out)
+    assert h_tt.rule == "two_threshold" and h_tt.combiner is not None and h_tt.combiner.rule == "two_threshold"
+    assert h_tt.thresholds == {"cos": 0.7, "overlap": 0.3} and h_tt.meta["rule"] == "two_threshold"
+    s_tt, _, d_tt = h_tt.score_embeddings_with_codes(q_emb[:5], q_codes[:5], ["python"] * 5)
+    assert d_tt[0]["rule"] == "two_threshold" and d_tt[0]["combiner_fitted"] is False
+    exp = two_threshold_score(np.array([make_features(d["cos"], d["overlap"], d["lcr_norm"], 0) for d in d_tt]), h_tt.thresholds)
+    assert np.allclose(s_tt, exp, atol=1e-5)
+    # обратное переключение: обученный логистический комбинатор сохранён в индексе
+    h_tt.set_rule("logistic")
+    assert h_tt.combiner is not None and h_tt.combiner.fitted and h_tt.meta["combiner_fitted"] is True
+    s_back, _, _ = h_tt.score_embeddings_with_codes(q_emb[:5], q_codes[:5], ["python"] * 5)
+    assert np.allclose(s_back, s_log, atol=2e-2)  # float16 на диске → cos ±1e-3 → логит ±(coef·1e-3)
+    # загрузка с logistic в cfg → логистический
+    h_log = HybridIndex(_cfg(tmp_path, hybrid_rule="logistic"))
+    h_log.load(out)
+    assert h_log.rule == "logistic" and h_log.combiner is not None and h_log.combiner.fitted
+    # индекс, сохранённый с two_threshold, тоже хранит обученный комбинатор
+    h_tt.set_rule("two_threshold")
+    out2 = tmp_path / "indexes" / "hybrid2"
+    h_tt.save(out2)
+    h3 = HybridIndex(_cfg(tmp_path, hybrid_rule="logistic"))
+    h3.load(out2)
+    assert h3.rule == "logistic" and h3.combiner is not None and h3.combiner.fitted
+    with pytest.raises(ValueError):
+        h3.set_rule("nope")
+
+
+def test_no_silent_rule_fallback(tmp_path):
+    """Minor: без обученного комбинатора правило logistic — ошибка, откат только по allow_rule_fallback."""
+    cfg, recs, M, h = _hybrid_fixture(tmp_path, rule="logistic")
+    assert h.combiner is None
+    with pytest.raises(RuntimeError):
+        h.score_embeddings_with_codes(M[:2], [r.code for r in recs[:2]], ["python"] * 2)
+    with pytest.raises(RuntimeError):  # нет public_train.jsonl → обучить нельзя
+        h.ensure_combiner(cfg, encoder=_HashEncoder())
+    cfg2, recs2, M2, h2 = _hybrid_fixture(tmp_path, rule="logistic")
+    cfg2["semantic"]["allow_rule_fallback"] = True
+    h2._configure(cfg2)
+    scores, best, details = h2.score_embeddings_with_codes(M2[:2], [r.code for r in recs2[:2]], ["python"] * 2)
+    assert details[0]["rule"] == "two_threshold" and h2.rule == "two_threshold" and "rule_fallback" in h2.meta
+    assert best == [recs2[0].id, recs2[1].id]
+    h3 = HybridIndex(cfg2)
+    h3.build_from_embeddings([r.id for r in recs2[:3]], M2[:3], [r.code for r in recs2[:3]], ["python"] * 3, meta={"model": "fake"})
+    assert h3.ensure_combiner(cfg2, encoder=_HashEncoder()).rule == "two_threshold" and h3.meta.get("rule_fallback")
+
+
+def test_collect_features_drops_ambiguous_duplicates(tmp_path):
+    """Minor: дубликат источника в индексе (overlap≈1) не получает метку 0."""
+    cfg = _cfg(tmp_path, hybrid_rule="logistic")
+    recs = _records(6)
+    dup = FunctionRecord(**{**recs[0].to_dict(), "id": "protected/other/dup.py:1-10", "repo": "other/repo"})
+    all_recs = recs + [dup]
+    enc = _HashEncoder()
+    E = enc.encode([r.code for r in all_recs])
+    h = HybridIndex(cfg)
+    h.build_from_embeddings([r.id for r in all_recs], E, [r.code for r in all_recs], ["python"] * 7, meta={"model": "fake-hash"})
+    q = enc.encode([recs[0].code])
+    stats: dict = {}
+    X, y, g = collect_features(h, q, [recs[0].code], ["python"], [1], [recs[0].id], stats=stats)
+    assert stats["n_dropped_ambiguous"] == 1 and y.sum() == 1 and len(y) == stats["n_rows"]
+    assert not any((y == 0) & (X[:, 1] >= 0.9))
+    X2, y2, _ = collect_features(h, q, [recs[0].code], ["python"], [1], [recs[0].id], drop_ambiguous=False)
+    assert len(y2) == len(y) + 1 and ((y2 == 0) & (X2[:, 1] >= 0.9)).sum() == 1
+
+
+def test_encoder_property_requires_checkpoint_for_own_model(tmp_path):
+    """Minor: own_small_model.enabled без checkpoint — ошибка, а не молчаливый HF-базис."""
+    cfg = _cfg(tmp_path)
+    cfg["semantic"]["own_small_model"] = {**cfg["semantic"]["own_small_model"], "enabled": True}
+    cfg["semantic"].pop("checkpoint", None)
+    idx = SemanticIndex(cfg)
+    with pytest.raises(ValueError):
+        _ = idx.encoder
+    assert "torch" not in sys.modules
+
+
+def test_hf_batch_tokenizer_prefix_format():
+    """Minor: формат входа UniXcoder [CLS] <encoder-only> [SEP] токены [SEP] и усечение до max_length−4."""
+    from smcode.semantic.model import HFBatchTokenizer, default_input_prefix
+
+    class FakeTok:
+        cls_token_id, sep_token_id, unk_token_id, pad_token_id = 0, 2, 3, 1
+        vocab = {"<encoder-only>": 9}
+
+        def convert_tokens_to_ids(self, t):
+            return self.vocab.get(t, self.unk_token_id)
+
+        def __call__(self, texts, add_special_tokens=True, truncation=True, max_length=512, padding=False, return_tensors=None):
+            ids = [[100 + i for i in range(len(t.split()))][:max_length] for t in texts]
+            if add_special_tokens:
+                ids = [[0] + x + [2] for x in ids]
+            return {"input_ids": ids}
+
+        def pad(self, enc, padding=True, return_tensors=None):
+            L = max(len(x) for x in enc["input_ids"])
+            ids = [x + [1] * (L - len(x)) for x in enc["input_ids"]]
+            mask = [[1] * len(x) + [0] * (L - len(x)) for x in enc["input_ids"]]
+            return {"input_ids": ids, "attention_mask": mask}
+
+    bt = HFBatchTokenizer(FakeTok(), max_length=8, prefix="<encoder-only>")
+    out = bt(["a b", "a b c d e f g h i j"])
+    assert out["input_ids"][0] == [0, 9, 2, 100, 101, 2, 1, 1]  # [CLS] <encoder-only> [SEP] a b [SEP] + паддинг
+    assert out["input_ids"][1] == [0, 9, 2, 100, 101, 102, 103, 2]  # усечение до max_length − 4 токенов тела
+    assert out["attention_mask"][0] == [1] * 6 + [0] * 2
+    plain = HFBatchTokenizer(FakeTok(), max_length=8, prefix="<unknown-mode>")  # неизвестный префикс → обычный вход
+    assert plain.prefix == "" and plain(["a b"])["input_ids"][0] == [0, 100, 101, 2]
+    assert default_input_prefix("microsoft/unixcoder-base") == "<encoder-only>" and default_input_prefix("codesage/codesage-small") == ""
+    enc = CodeEncoder({"semantic": {"base_model": "microsoft/unixcoder-base"}})
+    assert enc.input_prefix == "<encoder-only>" and enc.key == "microsoft/unixcoder-base"
+    assert CodeEncoder({"semantic": {"base_model": "microsoft/unixcoder-base", "input_prefix": ""}}).input_prefix == ""
+    assert "torch" not in sys.modules and "transformers" not in sys.modules
+
+
+def test_train_holdout_selection_is_repo_level(tmp_path):
+    """Minor: отбор эпохи — по отложенным репозиториям public_train; public_calib только для отчёта."""
+    train = importlib.import_module("smcode.semantic.train")
+    recs = []
+    for repo, n in (("a/one", 10), ("b/two", 10), ("c/three", 10), ("d/four", 30)):
+        rs = _records(n, split="public_train", repo=repo)
+        for i, r in enumerate(rs):
+            r.id, r.repo = f"public_train/{repo}/f{i}", repo
+        recs += rs
+    rng = random.Random(3)
+    tr, held = train.select_holdout(recs, 12, rng)
+    assert len(tr) + len(held) == len(recs) and len(held) >= 10
+    assert not ({r.repo for r in tr} & {r.repo for r in held})  # репозитории не пересекаются
+    cfg = _cfg(tmp_path)
+    a, p = train.val_pairs_from_records(cfg, held, 5, random.Random(1))
+    assert len(a) == len(p) == min(5, len(held)) and all(code for code, _ in p)
+    tc = train.TrainConfig(max_steps=1).resolved(cfg)
+    assert tc.val_on == "holdout"
+    assert train.TrainConfig(val_on="public_calib").resolved(cfg).val_on == "public_calib"
+    with pytest.raises(ValueError):
+        train.TrainConfig(val_on="nope").resolved(cfg)
+    one_repo = _records(8, split="public_train", repo="z/z")
+    for r in one_repo:
+        r.repo = "z/z"
+    tr1, held1 = train.select_holdout(one_repo, 3, random.Random(0))
+    assert len(held1) == 3 and len(tr1) == 5
+    assert "torch" not in sys.modules
+
+
+def test_latency_thread_counts_default_and_config(tmp_path):
+    from smcode.semantic.embed import latency_thread_counts
+
+    cfg = _cfg(tmp_path)
+    assert latency_thread_counts(cfg) == [1, 4]
+    cfg["eval"]["latency_threads"] = [8, 1, 1]
+    assert latency_thread_counts(cfg) == [1, 8]
+    cfg["eval"]["latency_threads"] = 2
+    assert latency_thread_counts(cfg) == [2]
+
+
+def test_scripts_fail_cleanly_without_torch(tmp_path):
+    """06_embed.py: без torch — код возврата 2 и сообщение, а не traceback (в т. ч. --own-model без чекпойнта)."""
+    import subprocess
+
+    import yaml
+
+    from smcode.types import write_jsonl
+
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg = load_config()
+    cfg.pop("_config_path", None)
+    cfg["paths"] = {**cfg["paths"], "functions": str(tmp_path / "f"), "queries": str(tmp_path / "q"),
+                    "embeddings": str(tmp_path / "e"), "results": str(tmp_path / "r"), "indexes": str(tmp_path / "i")}
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    write_jsonl(tmp_path / "f" / "protected.jsonl", _records(3))  # есть что кодировать → нужен torch
+    for extra in ([], ["--own-model"]):
+        proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "06_embed.py"), "--config", str(cfg_path), "--no-latency", *extra],
+                              capture_output=True, text=True, cwd=str(ROOT), timeout=120)
+        assert proc.returncode == 2, proc.stderr
+        assert "Traceback" not in proc.stderr

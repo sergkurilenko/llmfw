@@ -8,6 +8,7 @@ change_literals, combo — и общие помощники разбора дл�
 
 from __future__ import annotations
 
+import ast
 import logging
 import random
 import re
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
 from smcode import normalize
-from smcode.normalize import KEYWORDS, canon_lang, has_syntax_errors, tokenize
+from smcode.normalize import KEYWORDS, canon_lang, tokenize
 from smcode.types import TransformResult
 
 log = logging.getLogger(__name__)
@@ -188,18 +189,41 @@ def parse_code(code: str, lang: str) -> Parsed:
     return best
 
 
+def _syntax_broken(code: str, lang: str) -> bool:
+    """ERROR/MISSING в дереве; для python дополнительно — пустой ``block`` (висячий заголовок ``if x:``/``try:``
+    или функция с одним docstring после strip_comments) и проверка ``ast.parse`` (рассогласованные отступы):
+    tree-sitter такое принимает, CPython — нет."""
+    tree = normalize.parse(code, lang)
+    stack = [tree.root_node]
+    while stack:
+        n = stack.pop()
+        if n.type == "ERROR" or n.is_missing or n.has_error and n.child_count == 0:
+            return True
+        if lang == "python" and n.type == "block" and not any(
+                c.is_named and "comment" not in c.type for c in n.children):
+            return True
+        stack.extend(n.children)
+    if lang == "python":
+        try:
+            ast.parse(code)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return True
+    return False
+
+
 def parses_ok(code: str, lang: str) -> bool:
-    """True, если код разбирается без ERROR/MISSING сам по себе либо внутри стандартной обёртки."""
+    """True, если код разбирается без ERROR/MISSING (и без пустых блоков в python) сам по себе либо внутри
+    стандартной обёртки."""
     lang = canon_lang(lang)
     if not code.strip():
         return False
-    if not has_syntax_errors(code, lang):
+    if not _syntax_broken(code, lang):
         return True
     for kind in ("class", "func"):
         table = _CLASS_WRAP if kind == "class" else _FUNC_WRAP
         if lang in table:
             text, _, _ = _wrap(code, lang, kind)
-            if not has_syntax_errors(text, lang):
+            if not _syntax_broken(text, lang):
                 return True
     return False
 
@@ -323,11 +347,32 @@ def _detect_indent(lines: list[str]) -> str | None:
     return "4" if min(widths) >= 4 else "2"
 
 
-def _reindent(code: str, unit_from: str, unit_to: str) -> str:
+def _string_rows(code: str, lang: str) -> set[int]:
+    """Номера строк (0-based), начинающихся внутри многострочных строковых литералов (triple-quoted, raw strings,
+    text blocks): их ведущие пробелы — часть значения строки, reformat их не трогает."""
+    try:
+        p = parse_code(code, lang)
+    except Exception:  # pragma: no cover - защитный барьер
+        return set()
+    pre_rows = p.src[: p.prefix].count(b"\n")
+    rows: set[int] = set()
+    for n in leaves(p):
+        if not _is_atomic(n) or "comment" in n.type or "preproc" in n.type or not p.in_original(n):
+            continue
+        if n.end_point[0] > n.start_point[0]:
+            rows.update(range(n.start_point[0] + 1 - pre_rows, n.end_point[0] + 1 - pre_rows))
+    return rows
+
+
+def _reindent(code: str, unit_from: str, unit_to: str, keep_rows: set[int] | frozenset[int] = frozenset()) -> str:
+    """Смена единицы отступа; строки из ``keep_rows`` (внутри строковых литералов) остаются как есть."""
     unit_w = 1 if unit_from == "tab" else int(unit_from)
     new = "\t" if unit_to == "tab" else " " * int(unit_to)
     out: list[str] = []
-    for ln in code.split("\n"):
+    for i, ln in enumerate(code.split("\n")):
+        if i in keep_rows:
+            out.append(ln)
+            continue
         if not ln.strip():
             out.append(ln.rstrip())
             continue
@@ -518,7 +563,7 @@ def reformat(code: str, lang: str, rng: random.Random, **params: Any) -> Transfo
             out = _space_ops(out, lang, spaces)
         cur2 = _detect_indent(out.split("\n"))
         if cur2 is not None:
-            out = _reindent(out, cur2, indent_to)
+            out = _reindent(out, cur2, indent_to, keep_rows=_string_rows(out, lang))
         if not code.endswith("\n") and out.endswith("\n"):
             out = out.rstrip("\n")
         elif code.endswith("\n") and not out.endswith("\n"):
@@ -694,6 +739,57 @@ def _collect_declared(p: Parsed) -> tuple[list[str], list[Any]]:
     return names, fn_name_nodes
 
 
+_GO_INDEXED_LITERAL_TYPES = {"map_type", "slice_type", "array_type", "implicit_length_array_type"}
+
+
+def _go_literal_elem_type(p: Parsed, lit_value) -> Any | None:
+    """Тип элементов ``literal_value`` в go, включая вложенные литералы с опущенным типом
+    (``[]T{{...}}``, ``map[K]V{k: {...}}``); None — определить нельзя."""
+    elem = lit_value.parent
+    if elem is None:
+        return None
+    if elem.type == "composite_literal":
+        return elem.child_by_field_name("type")
+    if elem.type != "literal_element":
+        return None
+    holder = elem.parent  # keyed_element | literal_value
+    in_key = False
+    if holder is not None and holder.type == "keyed_element":
+        key = holder.child_by_field_name("key") or (holder.children[0] if holder.children else None)
+        in_key = key is not None and key == elem
+        holder = holder.parent
+    if holder is None or holder.type != "literal_value":
+        return None
+    outer = _go_literal_elem_type(p, holder)
+    if outer is not None and outer.type == "pointer_type":
+        named = [c for c in outer.children if c.is_named]
+        outer = named[-1] if named else None
+    if outer is None:
+        return None
+    if outer.type in ("slice_type", "array_type", "implicit_length_array_type"):
+        return outer.child_by_field_name("element")
+    if outer.type == "map_type":
+        return outer.child_by_field_name("key" if in_key else "value")
+    return None
+
+
+def _go_struct_field_key(p: Parsed, elem) -> bool:
+    """True, если ``literal_element`` — ключ ``keyed_element`` структурного литерала (имя поля, не локальное имя).
+    Ключи литералов map/slice/array — выражения, их переименовывать можно."""
+    ke = elem.parent
+    if ke is None or ke.type != "keyed_element":
+        return False
+    key = ke.child_by_field_name("key") or (ke.children[0] if ke.children else None)
+    if key is None or key != elem:
+        return False
+    lv = ke.parent
+    t = _go_literal_elem_type(p, lv) if lv is not None else None
+    if t is not None and t.type == "pointer_type":
+        named = [c for c in t.children if c.is_named]
+        t = named[-1] if named else None
+    return t is None or t.type not in _GO_INDEXED_LITERAL_TYPES
+
+
 def _excluded_use(p: Parsed, node) -> bool:
     """Позиции, где identifier не является ссылкой на локальное имя (обращения к членам, именованные аргументы...)."""
     par = node.parent
@@ -720,8 +816,7 @@ def _excluded_use(p: Parsed, node) -> bool:
         if pt == "field_designator" or pt == "designated_initializer":
             return True
     elif lang == "go":
-        if pt == "literal_element" and par.parent is not None and par.parent.type == "keyed_element" \
-                and par.parent.children and par.parent.children[0] is par:
+        if pt == "literal_element" and _go_struct_field_key(p, par):
             return True
         if pt in ("package_clause", "import_spec", "qualified_type"):
             return True
@@ -821,7 +916,51 @@ def rename_ids(code: str, lang: str, rng: random.Random, **params: Any) -> Trans
 _INT_RE = re.compile(r"^(0[xX][0-9a-fA-F]+|0[bB][01]+|[1-9][0-9]*|0)([uUlLnN]{0,3})$")
 _FLOAT_RE = re.compile(r"^([0-9]*)(\.?)([0-9]*)([eE][+-]?[0-9]+)?([fFlLdD]?)$")
 _STR_RE = re.compile(r"^([A-Za-z]{0,3})('''|\"\"\"|'|\"|`)(.*)(\2)$", re.S)
+# Символьные литералы C/C++/Java/Go (char_literal / character_literal / rune_literal): ровно один символ или escape.
+_CHAR_RE = re.compile(r"^(u8|[LuU])?'(\\(?:x[0-9a-fA-F]+|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|.)|[^'\\])'$")
+_CHAR_LANGS = {"c", "cpp", "java", "go"}
+_CHAR_POOL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# Узлы меток case: их литералы не меняем (дубликат метки — ошибка компиляции в C/C++/Java/Go).
+_CASE_LABEL_TYPES = {"case_statement", "switch_label", "expression_case"}
 _DELTAS = (1, 2, 3, 5, 7, 10, 16, 100)
+
+
+def _new_char(text: str, rng: random.Random) -> str | None:
+    """Замена символьного литерала другим одиночным символом (многосимвольный char — ошибка в Java)."""
+    m = _CHAR_RE.match(text)
+    if not m:
+        return None
+    prefix = text[: text.index("'")]
+    cur = m.group(2)
+    for _ in range(16):
+        c = rng.choice(_CHAR_POOL)
+        if c != cur:
+            return f"{prefix}'{c}'"
+    return None
+
+
+def _case_label_starts(code: str, lang: str) -> set[int]:
+    """Байтовые смещения листьев внутри меток ``case`` (до двоеточия) — по дереву исходного кода без обёртки,
+    в тех же координатах, что и ``normalize.tokenize``."""
+    if lang not in ("c", "cpp", "java", "go"):
+        return set()
+    out: set[int] = set()
+    stack = [normalize.parse(code, lang).root_node]
+    while stack:
+        n = stack.pop()
+        if n.type in _CASE_LABEL_TYPES:
+            for c in n.children:
+                if c.type in (":", "->"):
+                    break
+                inner = [c]
+                while inner:
+                    m = inner.pop()
+                    if m.child_count:
+                        inner.extend(m.children)
+                    else:
+                        out.add(m.start_byte)
+        stack.extend(n.children)
+    return out
 
 
 def _new_int(text: str, rng: random.Random) -> str | None:
@@ -882,19 +1021,26 @@ def _new_string(text: str, rng: random.Random) -> str | None:
 
 
 def change_literals(code: str, lang: str, rng: random.Random, **params: Any) -> TransformResult:
-    """Замена числовых и строковых литералов (docstring/комментарии не трогаются)."""
+    """Замена числовых, строковых и символьных литералов (docstring/комментарии и метки case не трогаются)."""
     lang = canon_lang(lang)
     frac = float(params.get("fraction", 1.0))
     src = code.encode("utf-8", "replace")
     edits: list[tuple[int, int, bytes]] = []
     n_num = n_str = 0
+    case_starts = _case_label_starts(code, lang)
     for tok in tokenize(code, lang):
         if tok.kind not in ("num", "str"):
+            continue
+        if tok.start in case_starts:
             continue
         if frac < 1.0 and rng.random() > frac:
             continue
         new = None
-        if tok.kind == "num":
+        if lang in _CHAR_LANGS and tok.text.endswith("'") and _CHAR_RE.match(tok.text):
+            new = _new_char(tok.text, rng)  # символьный литерал: один символ → другой символ
+            if new:
+                n_str += 1
+        elif tok.kind == "num":
             if "_" in tok.text or "'" in tok.text:
                 continue
             new = _new_int(tok.text, rng) or _new_float(tok.text, rng)

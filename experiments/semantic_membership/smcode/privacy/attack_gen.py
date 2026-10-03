@@ -300,11 +300,21 @@ def evaluate_gen_attack(model: Any, emb: np.ndarray, ref_tokens: Sequence[Sequen
     return m
 
 
+def eval_subset(n_eval: int, cfg: dict[str, Any], rng: Any = None) -> np.ndarray:
+    """Индексы подвыборки оценки A3 (≤ cfg.privacy.a3.eval_max, отсортированы); вызывающий код фиксирует её один раз,
+    чтобы BLEU/id_acc были сравнимы между защитами."""
+    n_ev = min(int(n_eval), int(gen_params(cfg)["eval_max"]))
+    if n_ev >= n_eval:
+        return np.arange(int(n_eval))
+    return np.sort(as_generator(rng if rng is not None else int(cfg.get("seed", 0))).choice(int(n_eval), size=n_ev, replace=False))
+
+
 def run_attack_gen(train_emb: np.ndarray, train_codes: Sequence[str], train_langs: Sequence[str], eval_emb: np.ndarray,
                    eval_codes: Sequence[str], eval_langs: Sequence[str], cfg: dict[str, Any], rng: Any = None,
-                   model: Any = None, vocab: GenVocab | None = None) -> tuple[dict[str, Any], Any, GenVocab]:
-    """A3 целиком (нужен torch): словарь и обучение на public_train (если model не задана), оценка на eval_emb.
-    Возвращает (метрики, модель, словарь)."""
+                   model: Any = None, vocab: GenVocab | None = None,
+                   eval_idx: np.ndarray | None = None) -> tuple[dict[str, Any], Any, GenVocab]:
+    """A3 целиком (нужен torch): словарь и обучение на public_train (если model не задана), оценка на eval_emb[eval_idx]
+    (eval_idx — фиксированная подвыборка, см. eval_subset; None → случайная по rng). Возвращает (метрики, модель, словарь)."""
     import torch  # noqa: F401 — ImportError без torch
 
     p = gen_params(cfg)
@@ -315,8 +325,7 @@ def run_attack_gen(train_emb: np.ndarray, train_codes: Sequence[str], train_lang
         toks = [lexical_tokens(train_codes[i], train_langs[i]) for i in idx]
         vocab = GenVocab.build(toks, int(p["vocab"]))
         model = train_gen_attack(np.asarray(train_emb)[idx], toks, vocab, cfg, seed=int(cfg.get("seed", 0)))
-    n_ev = min(len(eval_codes), int(p["eval_max"]))
-    eidx = np.sort(g.choice(len(eval_codes), size=n_ev, replace=False)) if n_ev < len(eval_codes) else np.arange(len(eval_codes))
+    eidx = np.asarray(eval_idx, dtype=np.int64) if eval_idx is not None else eval_subset(len(eval_codes), cfg, g)
     refs = [lexical_tokens(eval_codes[i], eval_langs[i]) for i in eidx]
     ids = [identifier_set(eval_codes[i], eval_langs[i]) for i in eidx]
     metrics = evaluate_gen_attack(model, np.asarray(eval_emb)[eidx], refs, ids, vocab, cfg)

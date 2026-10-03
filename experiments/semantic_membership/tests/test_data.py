@@ -678,8 +678,12 @@ def test_measure_repo(cfg, tmp_path, capsys):
 def test_pipeline_extract_dedup(cfg, tmp_path):
     fdir = tmp_path / "functions"
     outputs = extract.run_extract(cfg, workers=1)
-    assert set(outputs) == {"protected", "hard_neg", "public_train", "public_calib", "protected_windows"}
+    # окна строятся для cfg.windows.splits (protected + негативы public_calib/public_test; клонов public_test нет)
+    assert set(outputs) == {"protected", "hard_neg", "public_train", "public_calib", "protected_windows", "public_calib_windows"}
     assert not (fdir / "public_test.jsonl").exists()  # клонов этого сплита нет
+    assert extract.windows_splits(cfg) == ["protected", "public_calib", "public_test"]
+    calib_wins = list(read_functions(fdir / "public_calib_windows.jsonl"))
+    assert calib_wins and all(r.kind == "window" and r.split == "public_calib" for r in calib_wins)
 
     prot = list(read_functions(fdir / "protected.jsonl"))
     prot_paths = {r.path for r in prot}
@@ -722,7 +726,7 @@ def test_pipeline_extract_dedup(cfg, tmp_path):
     # ---- dedup
     stats = dedup_split.run_dedup(cfg, workers=1)
     assert (fdir / "stats.json").exists() and (fdir / "dedup_removed.jsonl").exists()
-    assert stats["config"]["exact_dedup_key"] == "normalized_sha" and stats["config"]["sha_protected_min_tokens"] == cfg["dedup"]["k"]
+    assert stats["config"]["exact_dedup_key"] == "normalized_sha" and stats["config"]["sha_protected_min_tokens"] == cfg["dedup"]["sha_protected_min_tokens"] == 0
     sp = stats["splits"]
     assert sp["protected"]["n_raw"] == 7 and sp["protected"]["n_final"] == 7 and sp["protected"]["removed_near_dup"] == 0
     assert stats["protected_fingerprints"] > 0
@@ -747,8 +751,12 @@ def test_pipeline_extract_dedup(cfg, tmp_path):
     assert sum(sp["protected"]["by_length_bin"].values()) == 7
     assert list(sp["protected"]["by_length_bin"]) == ["0-32", "32-64", "64-128", "128-256", "256-100000"]
     assert stats["windows"]["n_final"] == len(wins) - stats["windows"]["removed_exact"]
+    assert stats["windows_by_split"]["protected_windows"] == stats["windows"]
+    cw = stats["windows_by_split"]["public_calib_windows"]  # окна негативов фильтруются против protected
+    assert cw["n_raw"] == len(calib_wins) and cw["n_final"] == len(list(read_functions(fdir / "public_calib_windows.jsonl")))
     assert stats["totals"]["n_final"] == 7 + 2 + 4 + 7
-    assert set(stats["inputs"]) == {"protected.jsonl", "hard_neg.jsonl", "public_train.jsonl", "public_calib.jsonl", "protected_windows.jsonl"}
+    assert set(stats["inputs"]) == {"protected.jsonl", "hard_neg.jsonl", "public_train.jsonl", "public_calib.jsonl", "protected_windows.jsonl",
+                                    "public_calib_windows.jsonl"}
     # идемпотентность dedup: повторный вызов возвращает сохранённую статистику без изменений
     stats2 = dedup_split.run_dedup(cfg, workers=1)
     assert stats2 == stats
@@ -771,9 +779,11 @@ def test_pipeline_extract_dedup(cfg, tmp_path):
 
 
 def test_dedup_short_type2_clones_kept(tmp_path):
-    """Короткие структурные клоны (одинаковый normalized sha, n_tokens < k) остаются в негативах;
-    длинные совпадения по sha удаляются как sha_protected."""
-    cfg = _cfg_with_paths(tmp_path)
+    """При dedup.sha_protected_min_tokens = k короткие структурные клоны (одинаковый normalized sha, n_tokens < k)
+    остаются в негативах, длинные совпадения по sha удаляются как sha_protected; при значении по умолчанию (0)
+    удаляются все тип-2 клоны (иначе они получают метку 0 и искажают FPR в бине 0–32)."""
+    cfg = _cfg_with_paths(tmp_path, {"dedup": {"sha_protected_min_tokens": 25}})
+    assert cfg["dedup"]["sha_protected_min_tokens"] == cfg["dedup"]["k"] == 25
     fdir = tmp_path / "functions"
     short_p = "int f(void) {\n    return 1;\n}\n"
     short_h = "int h(void) {\n    return 2;\n}\n"
@@ -793,6 +803,13 @@ def test_dedup_short_type2_clones_kept(tmp_path):
     assert [r.code.splitlines()[0] for r in kept] == ["int h(void) {"]
     removed = [json.loads(l) for l in (fdir / "dedup_removed.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [(r["reason"], r["id"]) for r in removed] == [("sha_protected", hard[1].id)]
+    # значение по умолчанию (default.yaml: 0): удаляются оба клона, kept_short_sha_protected = 0
+    cfg0 = _cfg_with_paths(tmp_path)
+    assert cfg0["dedup"]["sha_protected_min_tokens"] == 0
+    write_jsonl(fdir / "hard_neg.jsonl", hard)
+    stats0 = dedup_split.run_dedup(cfg0, workers=1, force=True)
+    hs0 = stats0["splits"]["hard_neg"]
+    assert hs0["n_final"] == 0 and hs0["removed_sha_protected"] == 2 and hs0["kept_short_sha_protected"] == 0
 
 
 def test_run_extract_multiprocessing(cfg, tmp_path):

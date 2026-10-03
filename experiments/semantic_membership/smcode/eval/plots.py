@@ -1,8 +1,10 @@
 """Рисунки F1..F7 (DESIGN.md §10) из results/summary.json → cfg.paths.figures/*.png (300 dpi, подписи на русском).
 
 F1 TPR по преобразованиям; F2 TPR vs длина (бины токенов и L partial); F3 ROC члены vs hard_neg/public_test;
-F4 заявленный α vs эмпирический FPR; F5 абляция гибрида; F6 приватность–полезность (results/privacy.json);
-F7 латентность vs размер индекса (results/latency.json или точки из summary). Недостающие входы → рисунок
+F4 заявленный α vs эмпирический FPR (ошибки — кластерный бутстрэп по функциям, ci_cluster); F5 абляция гибрида;
+F6 приватность–полезность (results/privacy.json); F7 сквозная латентность одного запроса vs размер индекса
+(results/latency.json[method].by_size или summary.latency_ms.end_to_end: для амортизированных режимов semantic/hybrid —
+энкодер CPU-1 + бенчмарк батча 1; метод без такой оценки пропускается с предупреждением). Недостающие входы → рисунок
 пропускается с сообщением в лог. Цвета методов — фиксированный порядок категориальной палитры плюс маркеры.
 """
 
@@ -218,8 +220,9 @@ def fig_F3(summary: dict[str, Any], path: Path) -> Path | None:
 
 
 def fig_F4(summary: dict[str, Any], path: Path) -> Path | None:
-    """F4: заявленный α vs эмпирический FPR (ДИ Клоппера–Пирсона): круги — public_test, треугольники — hard_neg,
-    закрашенные — после доменной калибровки (hard_neg, тестовые репозитории); диагональ — точное выполнение гарантии."""
+    """F4: заявленный α vs эмпирический FPR (95 % ДИ кластерного бутстрэпа по исходной функции; при его отсутствии —
+    Клоппер–Пирсон): круги — public_test, треугольники — hard_neg, закрашенные — после доменной калибровки
+    (hard_neg, тестовые репозитории); диагональ — точное выполнение гарантии."""
     methods = order_methods(list(summary.get("methods", {})))
     aks = summary.get("alpha_keys") or []
     if not methods or not aks:
@@ -238,8 +241,9 @@ def fig_F4(summary: dict[str, Any], path: Path) -> Path | None:
                 if not blk or blk.get("value") is None:
                     continue
                 v = max(float(blk["value"]), 1e-5)
+                ci = blk.get("ci_cluster") or blk.get("ci") or [v, v]
                 xs.append(float(ak) * jitter); ys.append(v)
-                lo.append(max(0.0, v - max(float(blk["ci"][0]), 1e-5))); hi.append(max(0.0, float(blk["ci"][1]) - v))
+                lo.append(max(0.0, v - max(float(ci[0]), 1e-5))); hi.append(max(0.0, float(ci[1]) - v))
             if not xs:
                 continue
             drawn = True
@@ -253,7 +257,7 @@ def fig_F4(summary: dict[str, Any], path: Path) -> Path | None:
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlim(lim); ax.set_ylim(1e-5, 1.0)
     ax.set_xlabel("Заявленный уровень α")
-    ax.set_ylabel("Эмпирический FPR (ДИ Клоппера–Пирсона)")
+    ax.set_ylabel("Эмпирический FPR (95 % ДИ, кластерный бутстрэп по функциям)")
     ax.set_title("Конформная гарантия: заявленный α против эмпирического FPR")
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, fontsize=6.5)
     return _save(fig, path)
@@ -301,8 +305,29 @@ def _pareto(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
     return np.asarray(front, dtype=int)
 
 
+def _defense_tpr(d: dict[str, Any]) -> float:
+    """TPR@α защиты: hybrid, иначе semantic (RATE-блок или число); NaN если нет."""
+    for k in ("hybrid", "semantic"):
+        v = _get(d, "tpr", k)
+        if isinstance(v, dict):
+            v = v.get("value")
+        if v is not None:
+            return float(v)
+    return np.nan
+
+
+def privacy_points(defs: Sequence[dict[str, Any]], n: str) -> tuple[np.ndarray, np.ndarray]:
+    """(xs, ys) для F6 при n утёкших пар: x — F1 атаки A2 (0.0 — допустимое значение «атака полностью заблокирована»),
+    y — TPR защиты; отсутствующие значения — NaN."""
+    xs = []
+    for d in defs:
+        v = _get(d, "attacks", "A2", str(n), "f1")
+        xs.append(float(v) if v is not None else np.nan)
+    return np.asarray(xs, dtype=float), np.asarray([_defense_tpr(d) for d in defs], dtype=float)
+
+
 def fig_F6(privacy: dict[str, Any] | None, path: Path) -> Path | None:
-    """F6: кривые приватность–полезность из results/privacy.json: x — F1 атаки A2 при n утёкших пар, y — TPR@1 % (M4, иначе M3)."""
+    """F6: кривые приватность–полезность из results/privacy.json: x — F1 атаки A2 при n утёкших пар, y — TPR@α (M4, иначе M3)."""
     if not privacy:
         return None
     defs = privacy.get("defenses") or privacy.get("results") or []
@@ -312,21 +337,12 @@ def fig_F6(privacy: dict[str, Any] | None, path: Path) -> Path | None:
     ns = sorted(ns, key=lambda s: -float(s))[:2]
     if not defs or not ns:
         return None
-
-    def _tpr(d: dict[str, Any]) -> float:
-        for k in ("hybrid", "semantic"):
-            v = _get(d, "tpr", k)
-            if isinstance(v, dict):
-                v = v.get("value")
-            if v is not None:
-                return float(v)
-        return np.nan
+    alpha = privacy.get("alpha", 0.01)
 
     fig, axes = plt.subplots(1, len(ns), figsize=(4.2 * len(ns), 3.4), squeeze=False)
     drawn = False
     for ax, n in zip(axes[0], ns):
-        xs = np.array([float(_get(d, "attacks", "A2", n, "f1", default=np.nan) or np.nan) for d in defs])
-        ys = np.array([_tpr(d) for d in defs])
+        xs, ys = privacy_points(defs, n)
         ok = ~(np.isnan(xs) | np.isnan(ys))
         if not ok.any():
             ax.set_title(f"n = {n}: нет данных")
@@ -340,7 +356,7 @@ def fig_F6(privacy: dict[str, Any] | None, path: Path) -> Path | None:
         idx = np.flatnonzero(ok)[_pareto(xs[ok], ys[ok])]
         ax.plot(xs[idx], ys[idx], color=PALETTE[0], lw=1.2, linestyle="--", label="фронт Парето")
         ax.set_xlabel(f"Утечка: F1 атаки A2 при n = {n}")
-        ax.set_ylabel("Полезность: TPR при FPR = 1 %")
+        ax.set_ylabel(f"Полезность: TPR при FPR = {pct(alpha)}")
         ax.set_xlim(-0.02, 1.02); ax.set_ylim(0, 1.02)
         ax.set_title(f"n = {n} утёкших пар")
         ax.legend(loc="lower right")
@@ -351,9 +367,25 @@ def fig_F6(privacy: dict[str, Any] | None, path: Path) -> Path | None:
     return _save(fig, path)
 
 
+def latency_point(summary: dict[str, Any], m: str) -> tuple[float, float, str] | None:
+    """(N записей, p95 мс, подпись источника) для F7 из summary.latency_ms.end_to_end; None, если оценки нет
+    (амортизированный режим без --bench / latency_encoder.json) — такой метод в F7 не рисуется."""
+    n = _get(summary, "methods", m, "n_records")
+    lat = _get(summary, "methods", m, "latency_ms") or {}
+    e2e = lat.get("end_to_end") or {}
+    if not n or e2e.get("p95") is None:
+        return None
+    mode = str(lat.get("mode") or "")
+    label = "прогон eval" if mode.startswith("per_query") or not mode else ("энкодер CPU-1 + поиск, батч 1" if "batch_amortized" in mode else "батч 1 (query)")
+    return float(n), float(e2e["p95"]), label
+
+
 def fig_F7(summary: dict[str, Any], latency: dict[str, Any] | None, path: Path) -> Path | None:
-    """F7: p95 латентности как функция размера индекса N (лог-лог): точки из results/latency.json[method].by_size
-    (список {n, p95_ms}) или одна точка на метод из summary; пунктир — линейная экстраполяция; бюджеты чата/IDE."""
+    """F7: сквозная p95 латентности одного запроса как функция размера индекса N (лог-лог): точки из
+    results/latency.json[method].by_size (список {n, p95_ms}) или одна точка на метод из summary.latency_ms.end_to_end
+    (для semantic/hybrid в амортизированных режимах — энкодер CPU-1 + бенчмарк батча 1; без них метод пропускается
+    с предупреждением, чтобы не сравнивать амортизированное время батча с per_query); пунктир — линейная
+    экстраполяция; бюджеты чата/IDE."""
     methods = order_methods(list(summary.get("methods", {})))
     latency = latency or {}
     styles = style_for(methods)
@@ -361,17 +393,19 @@ def fig_F7(summary: dict[str, Any], latency: dict[str, Any] | None, path: Path) 
     drawn = False
     for m in methods:
         pts = [(float(p["n"]), float(p["p95_ms"])) for p in (_get(latency, m, "by_size") or []) if p.get("n") and p.get("p95_ms") is not None]
+        src = "results/latency.json"
         if not pts:
-            n = _get(summary, "methods", m, "n_records")
-            p95 = _get(summary, "methods", m, "latency_ms", "p95")
-            if n and p95 is not None:
-                pts = [(float(n), float(p95))]
-        if not pts:
-            continue
+            lp = latency_point(summary, m)
+            if lp is None:
+                lat = _get(summary, "methods", m, "latency_ms") or {}
+                reason = (lat.get("end_to_end") or {}).get("reason") or "нет n_records/латентности"
+                log.warning("F7: %s пропущен — нет сквозной латентности (режим %s): %s", m, lat.get("mode") or "—", reason)
+                continue
+            pts, src = [(lp[0], lp[1])], lp[2]
         drawn = True
         c, mk = styles[m]
         xs, ys = np.array([p[0] for p in pts]), np.array([p[1] for p in pts])
-        ax.plot(xs, ys, marker=mk, color=c, lw=1.4, ms=5, label=method_label(m))
+        ax.plot(xs, ys, marker=mk, color=c, lw=1.4, ms=5, label=f"{method_label(m)} ({src})")
         if len(pts) >= 2:
             k = (ys[-1] - ys[0]) / max(xs[-1] - xs[0], 1e-9)
             xe = np.array([xs[-1], 1e6 if xs[-1] < 1e6 else xs[-1] * 2])
@@ -385,9 +419,9 @@ def fig_F7(summary: dict[str, Any], latency: dict[str, Any] | None, path: Path) 
         ax.axhline(y, color=MUTED, linestyle=":", lw=1.0)
         ax.text(0.99, y, lab, color=MUTED, fontsize=7, va="bottom", ha="right", transform=tr)
     ax.set_xlabel("Размер индекса N, записей")
-    ax.set_ylabel("Латентность p95, мс")
+    ax.set_ylabel("Сквозная латентность запроса p95, мс (CPU, 1 поток)")
     ax.set_title("Латентность против размера индекса (пунктир — линейная экстраполяция)")
-    ax.legend(loc="upper left")
+    ax.legend(loc="upper left", fontsize=6.5)
     return _save(fig, path)
 
 
@@ -432,4 +466,5 @@ def write_figures(cfg: dict[str, Any], summary: dict[str, Any]) -> dict[str, Pat
     return out
 
 
-__all__ = ["write_figures", "FIGURE_FILES", "fig_F1", "fig_F2", "fig_F3", "fig_F4", "fig_F5", "fig_F6", "fig_F7"]
+__all__ = ["write_figures", "FIGURE_FILES", "fig_F1", "fig_F2", "fig_F3", "fig_F4", "fig_F5", "fig_F6", "fig_F7",
+           "privacy_points", "latency_point", "style_for"]

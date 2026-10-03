@@ -1,0 +1,4 @@
+# LLM-преобразования (scripts/03_build_queries.py --llm-only: paraphrase/translate, transforms/llm_paraphrase.py).
+# Рекомендуется ОТДЕЛЬНЫЙ venv (venv-llm): vllm фиксирует точную версию torch и может не совпасть с CUDA-драйвером машины.
+-r requirements.txt
+vllm>=0.6
